@@ -7,20 +7,28 @@ mod pool;
 use pool::ProcessPool;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "croutond",
-    about = "Maintain a supervised pool of external programs"
-)]
+#[command(name = "croutond", about = "Supervised pool of external programs.")]
 struct Cli {
-    #[arg(long, help = "Run a single slot state-machine smoke test and exit")]
+    #[arg(long, help = "Run a VM slot smoke test and exit")]
     smoke_slot: bool,
 
-    #[arg(value_parser = parse_pool_size)]
+    #[arg(
+        short,
+        long,
+        value_parser = parse_pool_size,
+        default_value_t = 4,
+        help = "Number of VM slots [default: 4]"
+    )]
     pool_size: usize,
 
+    #[arg(help = "Program to launch in each slot")]
     program: String,
 
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Arguments for the program"
+    )]
     args: Vec<OsString>,
 }
 
