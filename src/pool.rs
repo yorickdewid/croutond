@@ -319,7 +319,7 @@ async fn supervise_slot(
         }
 
         while let Ok(command) = commands.try_recv() {
-            handle_command(command, &mut runtime).await;
+            handle_command(command, &mut runtime, &api_socket).await;
         }
 
         if let Some(child) = runtime.child.as_mut() {
@@ -348,6 +348,7 @@ async fn supervise_slot(
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
                     runtime.status.owner = None;
+                    cleanup_api_socket(&api_socket);
                     eprintln!("vmm {} failed while polling exit: {error}", slot);
                 }
             }
@@ -365,7 +366,7 @@ async fn supervise_slot(
             }
             maybe_command = commands.recv() => {
                 if let Some(command) = maybe_command {
-                    handle_command(command, &mut runtime).await;
+                    handle_command(command, &mut runtime, &api_socket).await;
                 } else {
                     if let Some(child) = runtime.child.as_mut() {
                         stop_child(child).await;
@@ -386,7 +387,7 @@ fn should_spawn(state: SlotState) -> bool {
     )
 }
 
-async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime) {
+async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_socket: &Path) {
     match command {
         SlotCommand::GetVmStatus { response } => {
             let _ = response.send(runtime.status.clone());
@@ -446,6 +447,7 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime) {
                 stop_child(child).await;
                 runtime.child = None;
             }
+            cleanup_api_socket(api_socket);
 
             let _ = response.send(Ok(runtime.status.clone()));
         }
@@ -454,6 +456,7 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime) {
                 stop_child(child).await;
                 runtime.child = None;
             }
+            cleanup_api_socket(api_socket);
 
             runtime.status.state = SlotState::Empty;
             runtime.status.owner = None;
