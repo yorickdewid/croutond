@@ -280,7 +280,11 @@ async fn supervise_slot(
         }
 
         if runtime.child.is_none() && should_spawn(runtime.status.state) {
-            match Command::new(&program).args(&args).spawn() {
+            match Command::new(&program)
+                .args(&args)
+                .env("VMM_SLOT", slot.to_string())
+                .spawn()
+            {
                 Ok(child) => {
                     runtime.status.pid = child.id();
                     runtime.status.last_error = None;
