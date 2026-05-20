@@ -11,7 +11,10 @@ const ENV_PROGRAM: &str = "CLOUD_HYPERVISOR";
 const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";
 
 #[derive(Debug, Parser)]
-#[command(name = "croutond", about = "Virtual machine orchestration daemon")]
+#[command(
+    name = "croutond",
+    about = "Crouton virtual machine orchestrator daemon"
+)]
 struct Cli {
     #[arg(long, help = "Run a VM slot smoke test and exit")]
     smoke_slot: bool,
@@ -87,6 +90,7 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let (program, args) = resolve_program_and_args().map_err(io::Error::other)?;
+    std::fs::create_dir_all(&cli.vm_path)?;
 
     let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.vm_path).await?;
 
