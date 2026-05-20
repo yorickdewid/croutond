@@ -271,6 +271,7 @@ async fn supervise_slot(
     slot: usize,
     program: String,
     args: Vec<OsString>,
+    api_socket: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
     mut commands: mpsc::Receiver<SlotCommand>,
 ) {
@@ -291,10 +292,13 @@ async fn supervise_slot(
             if let Some(child) = runtime.child.as_mut() {
                 stop_child(child).await;
             }
+            cleanup_api_socket(&api_socket);
             break;
         }
 
         if runtime.child.is_none() && should_spawn(runtime.status.state) {
+            cleanup_api_socket(&api_socket);
+
             match Command::new(&program)
                 .args(&args)
                 .env("VMM_SLOT", slot.to_string())
@@ -324,6 +328,7 @@ async fn supervise_slot(
                 Ok(Some(status)) => {
                     runtime.child = None;
                     runtime.status.pid = None;
+                    cleanup_api_socket(&api_socket);
                     println!("vmm {} exited with status {}", slot, status);
 
                     match runtime.status.state {
@@ -355,6 +360,7 @@ async fn supervise_slot(
                     if let Some(child) = runtime.child.as_mut() {
                         stop_child(child).await;
                     }
+                    cleanup_api_socket(&api_socket);
                     break;
                 }
             }
@@ -365,6 +371,7 @@ async fn supervise_slot(
                     if let Some(child) = runtime.child.as_mut() {
                         stop_child(child).await;
                     }
+                    cleanup_api_socket(&api_socket);
                     break;
                 }
             }
@@ -472,5 +479,16 @@ async fn stop_child(child: &mut Child) {
 
     if let Err(error) = child.wait().await {
         eprintln!("failed while waiting for child shutdown: {error}");
+    }
+}
+
+fn cleanup_api_socket(api_socket: &Path) {
+    match std::fs::remove_file(api_socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "failed to remove api socket {}: {error}",
+            api_socket.display()
+        ),
     }
 }
