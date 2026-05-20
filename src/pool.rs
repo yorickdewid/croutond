@@ -303,14 +303,14 @@ async fn supervise_slot(
                 Ok(child) => {
                     runtime.status.pid = child.id();
                     runtime.status.last_error = None;
-                    println!("spawned child {} with pid {:?}", slot, runtime.status.pid);
+                    println!("spawned vmm {} with pid {:?}", slot, runtime.status.pid);
                     runtime.child = Some(child);
                 }
                 Err(error) => {
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
                     runtime.status.pid = None;
-                    eprintln!("worker {} failed to spawn child: {error}", slot);
+                    eprintln!("vmm {} failed to spawn child: {error}", slot);
                 }
             }
         }
@@ -324,7 +324,7 @@ async fn supervise_slot(
                 Ok(Some(status)) => {
                     runtime.child = None;
                     runtime.status.pid = None;
-                    println!("child {} exited with status {}", slot, status);
+                    println!("vmm {} exited with status {}", slot, status);
 
                     match runtime.status.state {
                         SlotState::Empty => {}
@@ -344,7 +344,7 @@ async fn supervise_slot(
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
                     runtime.status.owner = None;
-                    eprintln!("child {} failed while polling exit: {error}", slot);
+                    eprintln!("vmm {} failed while polling exit: {error}", slot);
                 }
             }
         }

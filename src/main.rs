@@ -97,7 +97,7 @@ async fn main() -> io::Result<()> {
     }
 
     println!(
-        "process pool is running with {} child processes; press Ctrl+C to stop",
+        "orchestrator pool is running with {} child processes",
         pool.size()
     );
 
