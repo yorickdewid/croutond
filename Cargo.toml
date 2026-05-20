@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+shlex = "1"
 tokio = { version = "1", features = ["full"] }
