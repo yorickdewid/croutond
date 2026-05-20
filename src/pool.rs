@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::{
     io,
@@ -99,14 +99,13 @@ fn initialize_slot(
     let (tx, rx) = mpsc::channel(16);
 
     let program = program.to_owned();
-    let vm_path = vm_path.to_path_buf();
     let mut args = args.to_vec();
     let api_socket = vm_path.join(format!("vmm{slot}.sock"));
     args.push("--api-socket".into());
-    args.push(api_socket.into_os_string());
+    args.push(api_socket.clone().into_os_string());
 
     let worker = tokio::spawn(async move {
-        supervise_slot(slot, program, args, shutdown_rx, rx).await;
+        supervise_slot(slot, program, args, api_socket, shutdown_rx, rx).await;
     });
 
     SlotHandle { tx, worker }
