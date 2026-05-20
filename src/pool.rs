@@ -94,9 +94,12 @@ fn initialize_slot(
     args: &[OsString],
     shutdown_rx: watch::Receiver<bool>,
 ) -> SlotHandle {
-    let program = program.to_owned();
-    let args = args.to_vec();
     let (tx, rx) = mpsc::channel(16);
+
+    let program = program.to_owned();
+    let mut args = args.to_vec();
+    args.push("--api-socket".into());
+    args.push(format!("/tmp/vmm{}.sock", slot).into());
 
     let worker = tokio::spawn(async move {
         supervise_slot(slot, program, args, shutdown_rx, rx).await;
