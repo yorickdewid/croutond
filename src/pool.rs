@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::Path;
 
 use tokio::{
     io,
@@ -92,14 +93,17 @@ fn initialize_slot(
     slot: usize,
     program: &str,
     args: &[OsString],
+    vm_path: &Path,
     shutdown_rx: watch::Receiver<bool>,
 ) -> SlotHandle {
     let (tx, rx) = mpsc::channel(16);
 
     let program = program.to_owned();
+    let vm_path = vm_path.to_path_buf();
     let mut args = args.to_vec();
+    let api_socket = vm_path.join(format!("vmm{slot}.sock"));
     args.push("--api-socket".into());
-    args.push(format!("/tmp/vmm{}.sock", slot).into());
+    args.push(api_socket.into_os_string());
 
     let worker = tokio::spawn(async move {
         supervise_slot(slot, program, args, shutdown_rx, rx).await;
@@ -109,27 +113,38 @@ fn initialize_slot(
 }
 
 impl ProcessPool {
-    pub async fn spawn(pool_size: usize, program: &str, args: &[OsString]) -> io::Result<Self> {
+    pub async fn spawn(
+        pool_size: usize,
+        program: &str,
+        args: &[OsString],
+        vm_path: &Path,
+    ) -> io::Result<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut slots = Vec::with_capacity(pool_size);
 
         for slot in 0..pool_size {
             let shutdown_rx = shutdown_rx.clone();
-            slots.push(initialize_slot(slot, program, args, shutdown_rx));
+            slots.push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
         }
 
         Ok(Self { shutdown_tx, slots })
     }
 
     #[allow(dead_code)]
-    pub async fn extend(&mut self, additional_size: usize, program: &str, args: &[OsString]) {
+    pub async fn extend(
+        &mut self,
+        additional_size: usize,
+        program: &str,
+        args: &[OsString],
+        vm_path: &Path,
+    ) {
         let current_size = self.slots.len();
         let new_size = current_size + additional_size;
 
         for slot in current_size..new_size {
             let shutdown_rx = self.shutdown_tx.subscribe();
             self.slots
-                .push(initialize_slot(slot, program, args, shutdown_rx));
+                .push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
         }
     }
 

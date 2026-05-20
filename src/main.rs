@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -23,6 +24,9 @@ struct Cli {
         help = "Number of VM slots"
     )]
     pool_size: usize,
+
+    #[arg(long, default_value = "/tmp", help = "Path to the VM data directory")]
+    vm_path: PathBuf,
 }
 
 fn resolve_program_and_args() -> Result<(String, Vec<OsString>), String> {
@@ -84,7 +88,7 @@ async fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let (program, args) = resolve_program_and_args().map_err(io::Error::other)?;
 
-    let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args).await?;
+    let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.vm_path).await?;
 
     if cli.smoke_slot {
         run_slot_smoke(&pool).await?;
