@@ -1,9 +1,12 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
+use axum::http::Method;
 use serde::Serialize;
 use tokio::{
-    io,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -12,6 +15,25 @@ use tokio::{
 pub struct ProcessPool {
     shutdown_tx: watch::Sender<bool>,
     slots: Vec<SlotHandle>,
+    vm_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VmRuntime {
+    pub name: String,
+    pub mac: String,
+    pub tap: String,
+    pub pid: u32,
+    pub state: VmState,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmState {
+    Booting,
+    Running,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,35 +49,58 @@ pub struct SlotStatus {
     pub slot: usize,
     pub generation: u64,
     pub state: SlotState,
-    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tap: Option<String>,
     pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
 #[derive(Debug)]
-pub enum SlotError {
+pub enum PoolError {
     InvalidTransition {
         slot: usize,
         from: SlotState,
         action: &'static str,
     },
     SlotNotFound(usize),
+    VmNotFound(String),
+    VmAlreadyRunning(String),
+    NoAvailableSlot,
     ChannelClosed,
+    Backend(String),
 }
 
-impl std::fmt::Display for SlotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTransition { slot, from, action } => {
                 write!(f, "slot {slot} cannot perform {action} from state {from:?}")
             }
             Self::SlotNotFound(slot) => write!(f, "slot {slot} does not exist"),
+            Self::VmNotFound(name) => write!(f, "VM '{name}' not found"),
+            Self::VmAlreadyRunning(name) => write!(f, "VM '{name}' is already running"),
+            Self::NoAvailableSlot => write!(f, "pool is exhausted"),
             Self::ChannelClosed => write!(f, "slot worker channel is closed"),
+            Self::Backend(error) => write!(f, "backend request failed: {error}"),
         }
     }
 }
 
-impl std::error::Error for SlotError {}
+impl std::error::Error for PoolError {}
+
+#[derive(Debug, Clone)]
+pub struct ProxyResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
 
 struct SlotHandle {
     tx: mpsc::Sender<SlotCommand>,
@@ -69,21 +114,24 @@ struct SlotRuntime {
 
 enum SlotCommand {
     ReserveVm {
-        owner: String,
-        response: oneshot::Sender<Result<SlotStatus, SlotError>>,
+        name: String,
+        mac: String,
+        tap: String,
+        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
     MarkVmBooted {
-        response: oneshot::Sender<Result<SlotStatus, SlotError>>,
+        started_at: String,
+        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
     ReleaseVm {
-        response: oneshot::Sender<Result<SlotStatus, SlotError>>,
+        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
     MarkVmFailed {
         reason: String,
-        response: oneshot::Sender<Result<SlotStatus, SlotError>>,
+        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
     ResetVm {
-        response: oneshot::Sender<Result<SlotStatus, SlotError>>,
+        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
     GetVmStatus {
         response: oneshot::Sender<SlotStatus>,
@@ -118,7 +166,7 @@ impl ProcessPool {
         program: &str,
         args: &[OsString],
         vm_path: &Path,
-    ) -> io::Result<Self> {
+    ) -> std::io::Result<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut slots = Vec::with_capacity(pool_size);
 
@@ -127,7 +175,11 @@ impl ProcessPool {
             slots.push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
         }
 
-        Ok(Self { shutdown_tx, slots })
+        Ok(Self {
+            shutdown_tx,
+            slots,
+            vm_path: vm_path.to_path_buf(),
+        })
     }
 
     #[allow(dead_code)]
@@ -148,7 +200,7 @@ impl ProcessPool {
         }
     }
 
-    pub async fn list_vm_slots(&self) -> Result<Vec<SlotStatus>, SlotError> {
+    pub async fn list_vm_slots(&self) -> Result<Vec<SlotStatus>, PoolError> {
         let mut statuses = Vec::with_capacity(self.slots.len());
 
         for slot in 0..self.slots.len() {
@@ -158,71 +210,163 @@ impl ProcessPool {
         Ok(statuses)
     }
 
-    pub async fn get_vm_slot_status(&self, slot: usize) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+    pub async fn get_vm_slot_status(&self, slot: usize) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
             .tx
             .send(SlotCommand::GetVmStatus { response: tx })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)
+        rx.await.map_err(|_| PoolError::ChannelClosed)
+    }
+
+    pub async fn pool_idle(&self) -> Result<usize, PoolError> {
+        Ok(self
+            .list_vm_slots()
+            .await?
+            .into_iter()
+            .filter(|status| status.state == SlotState::Empty)
+            .count())
+    }
+
+    pub async fn pool_in_use(&self) -> Result<usize, PoolError> {
+        Ok(self
+            .list_vm_slots()
+            .await?
+            .into_iter()
+            .filter(|status| status.state != SlotState::Empty)
+            .count())
+    }
+
+    pub fn size(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn vm_socket_path(&self, slot: usize) -> PathBuf {
+        self.vm_path.join(format!("vmm{slot}.sock"))
+    }
+
+    pub async fn find_vm_slot_status_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<SlotStatus>, PoolError> {
+        Ok(self
+            .list_vm_slots()
+            .await?
+            .into_iter()
+            .find(|status| status.name.as_deref() == Some(name)))
+    }
+
+    pub async fn find_vm_runtime_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<VmRuntime>, PoolError> {
+        Ok(self
+            .list_running_vms()
+            .await?
+            .into_iter()
+            .find(|runtime| runtime.name == name))
+    }
+
+    pub async fn list_running_vms(&self) -> Result<Vec<VmRuntime>, PoolError> {
+        let mut running = Vec::new();
+
+        for status in self.list_vm_slots().await? {
+            if let Some(runtime) = runtime_from_slot_status(&status) {
+                running.push(runtime);
+            }
+        }
+
+        Ok(running)
     }
 
     pub async fn reserve_vm_slot(
         &self,
         slot: usize,
-        owner: String,
-    ) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+        name: String,
+        mac: String,
+        tap: String,
+    ) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
             .tx
             .send(SlotCommand::ReserveVm {
-                owner,
+                name,
+                mac,
+                tap,
                 response: tx,
             })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)?
+        rx.await.map_err(|_| PoolError::ChannelClosed)?
     }
 
-    pub async fn mark_vm_slot_booted(&self, slot: usize) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+    pub async fn allocate_vm_slot(
+        &self,
+        name: String,
+        mac: String,
+    ) -> Result<SlotStatus, PoolError> {
+        if self.find_vm_slot_status_by_name(&name).await?.is_some() {
+            return Err(PoolError::VmAlreadyRunning(name));
+        }
+
+        let slot = self
+            .list_vm_slots()
+            .await?
+            .into_iter()
+            .find(|status| status.state == SlotState::Empty)
+            .map(|status| status.slot)
+            .ok_or(PoolError::NoAvailableSlot)?;
+
+        let tap = format!("tap{slot}");
+        self.reserve_vm_slot(slot, name, mac, tap).await
+    }
+
+    pub async fn mark_vm_slot_booted(
+        &self,
+        slot: usize,
+        started_at: String,
+    ) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
             .tx
-            .send(SlotCommand::MarkVmBooted { response: tx })
+            .send(SlotCommand::MarkVmBooted {
+                started_at,
+                response: tx,
+            })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)?
+        rx.await.map_err(|_| PoolError::ChannelClosed)?
     }
 
-    pub async fn release_vm_slot(&self, slot: usize) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+    pub async fn release_vm_slot(&self, slot: usize) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
             .tx
             .send(SlotCommand::ReleaseVm { response: tx })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)?
+        rx.await.map_err(|_| PoolError::ChannelClosed)?
     }
 
     pub async fn mark_vm_slot_failed(
         &self,
         slot: usize,
         reason: String,
-    ) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+    ) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
@@ -232,22 +376,47 @@ impl ProcessPool {
                 response: tx,
             })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)?
+        rx.await.map_err(|_| PoolError::ChannelClosed)?
     }
 
-    pub async fn reset_vm_slot(&self, slot: usize) -> Result<SlotStatus, SlotError> {
-        let handle = self.slots.get(slot).ok_or(SlotError::SlotNotFound(slot))?;
+    pub async fn reset_vm_slot(&self, slot: usize) -> Result<SlotStatus, PoolError> {
+        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
         let (tx, rx) = oneshot::channel();
 
         handle
             .tx
             .send(SlotCommand::ResetVm { response: tx })
             .await
-            .map_err(|_| SlotError::ChannelClosed)?;
+            .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| SlotError::ChannelClosed)?
+        rx.await.map_err(|_| PoolError::ChannelClosed)?
+    }
+
+    pub async fn proxy_vm_request(
+        &self,
+        slot: usize,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<ProxyResponse, PoolError> {
+        self.proxy_vm_request_with_content_type(slot, method, path, body, None)
+            .await
+    }
+
+    pub async fn proxy_vm_request_with_content_type(
+        &self,
+        slot: usize,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<ProxyResponse, PoolError> {
+        let socket_path = self.vm_socket_path(slot);
+        send_unix_http_request(&socket_path, method, path, body, content_type)
+            .await
+            .map_err(|error| PoolError::Backend(error.to_string()))
     }
 
     pub async fn shutdown(&mut self) {
@@ -260,10 +429,6 @@ impl ProcessPool {
                 eprintln!("worker task failed during shutdown: {error}");
             }
         }
-    }
-
-    pub fn size(&self) -> usize {
-        self.slots.len()
     }
 }
 
@@ -280,8 +445,11 @@ async fn supervise_slot(
             slot,
             generation: 0,
             state: SlotState::Empty,
-            owner: None,
+            name: None,
+            mac: None,
+            tap: None,
             pid: None,
+            started_at: None,
             last_error: None,
         },
         child: None,
@@ -302,12 +470,24 @@ async fn supervise_slot(
             match Command::new(&program)
                 .args(&args)
                 .env("VMM_SLOT", slot.to_string())
+                .env(
+                    "VMM_PATH",
+                    api_socket
+                        .parent()
+                        .unwrap_or(Path::new("/"))
+                        .display()
+                        .to_string(),
+                )
                 .spawn()
             {
                 Ok(child) => {
                     runtime.status.pid = child.id();
                     runtime.status.last_error = None;
-                    println!("spawned vmm {} with pid {:?}", slot, runtime.status.pid);
+                    println!(
+                        "spawned vmm {} with pid {:?}",
+                        slot,
+                        runtime.status.pid.unwrap_or(0)
+                    );
                     runtime.child = Some(child);
                 }
                 Err(error) => {
@@ -337,7 +517,7 @@ async fn supervise_slot(
                             runtime.status.state = SlotState::Failed;
                             runtime.status.last_error =
                                 Some("vm process exited unexpectedly".to_string());
-                            runtime.status.owner = None;
+                            runtime.status.started_at = None;
                         }
                         SlotState::Failed => {}
                     }
@@ -348,7 +528,6 @@ async fn supervise_slot(
                     runtime.status.pid = None;
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
-                    runtime.status.owner = None;
                     cleanup_api_socket(&api_socket);
                     eprintln!("vmm {} failed while polling exit: {error}", slot);
                 }
@@ -393,15 +572,23 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
         SlotCommand::GetVmStatus { response } => {
             let _ = response.send(runtime.status.clone());
         }
-        SlotCommand::ReserveVm { owner, response } => {
+        SlotCommand::ReserveVm {
+            name,
+            mac,
+            tap,
+            response,
+        } => {
             let result = if runtime.status.state == SlotState::Empty {
                 runtime.status.state = SlotState::Booting;
-                runtime.status.owner = Some(owner);
+                runtime.status.name = Some(name);
+                runtime.status.mac = Some(mac);
+                runtime.status.tap = Some(tap);
                 runtime.status.generation += 1;
                 runtime.status.last_error = None;
+                runtime.status.started_at = None;
                 Ok(runtime.status.clone())
             } else {
-                Err(SlotError::InvalidTransition {
+                Err(PoolError::InvalidTransition {
                     slot: runtime.status.slot,
                     from: runtime.status.state,
                     action: "claim",
@@ -409,12 +596,16 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
             };
             let _ = response.send(result);
         }
-        SlotCommand::MarkVmBooted { response } => {
+        SlotCommand::MarkVmBooted {
+            started_at,
+            response,
+        } => {
             let result = if runtime.status.state == SlotState::Booting {
                 runtime.status.state = SlotState::Occupied;
+                runtime.status.started_at = Some(started_at);
                 Ok(runtime.status.clone())
             } else {
-                Err(SlotError::InvalidTransition {
+                Err(PoolError::InvalidTransition {
                     slot: runtime.status.slot,
                     from: runtime.status.state,
                     action: "mark_booted",
@@ -425,12 +616,23 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
         SlotCommand::ReleaseVm { response } => {
             let result = if runtime.status.state == SlotState::Occupied {
                 runtime.status.state = SlotState::Empty;
-                runtime.status.owner = None;
+                runtime.status.name = None;
+                runtime.status.mac = None;
+                runtime.status.tap = None;
                 runtime.status.generation += 1;
                 runtime.status.last_error = None;
+                runtime.status.started_at = None;
+                runtime.status.pid = None;
+
+                if let Some(child) = runtime.child.as_mut() {
+                    stop_child(child).await;
+                    runtime.child = None;
+                }
+                cleanup_api_socket(api_socket);
+
                 Ok(runtime.status.clone())
             } else {
-                Err(SlotError::InvalidTransition {
+                Err(PoolError::InvalidTransition {
                     slot: runtime.status.slot,
                     from: runtime.status.state,
                     action: "release",
@@ -441,8 +643,8 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
         SlotCommand::MarkVmFailed { reason, response } => {
             runtime.status.state = SlotState::Failed;
             runtime.status.last_error = Some(reason);
-            runtime.status.owner = None;
             runtime.status.pid = None;
+            runtime.status.started_at = None;
 
             if let Some(child) = runtime.child.as_mut() {
                 stop_child(child).await;
@@ -460,9 +662,12 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
             cleanup_api_socket(api_socket);
 
             runtime.status.state = SlotState::Empty;
-            runtime.status.owner = None;
+            runtime.status.name = None;
+            runtime.status.mac = None;
+            runtime.status.tap = None;
             runtime.status.pid = None;
             runtime.status.last_error = None;
+            runtime.status.started_at = None;
             runtime.status.generation += 1;
 
             let _ = response.send(Ok(runtime.status.clone()));
@@ -494,4 +699,105 @@ fn cleanup_api_socket(api_socket: &Path) {
             api_socket.display()
         ),
     }
+}
+
+fn runtime_from_slot_status(status: &SlotStatus) -> Option<VmRuntime> {
+    if status.state != SlotState::Occupied {
+        return None;
+    }
+
+    Some(VmRuntime {
+        name: status.name.clone()?,
+        mac: status.mac.clone()?,
+        tap: status.tap.clone()?,
+        pid: status.pid?,
+        state: VmState::Running,
+        started_at: status.started_at.clone()?,
+    })
+}
+
+async fn send_unix_http_request(
+    socket_path: &Path,
+    method: Method,
+    path: &str,
+    body: Vec<u8>,
+    content_type: Option<&str>,
+) -> std::io::Result<ProxyResponse> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    let mut request = format!(
+        "{} {} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n",
+        method.as_str(),
+        path,
+        body.len()
+    );
+
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("content-type: {content_type}\r\n"));
+    }
+
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    if !body.is_empty() {
+        stream.write_all(&body).await?;
+    }
+    stream.shutdown().await?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+
+    parse_http_response(response)
+}
+
+fn parse_http_response(response: Vec<u8>) -> std::io::Result<ProxyResponse> {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing HTTP header terminator",
+            )
+        })?;
+
+    let (header_bytes, body) = response.split_at(split + 4);
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let mut lines = header_text.lines();
+    let status_line = lines.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing HTTP status line")
+    })?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP status line")
+        })?
+        .parse::<u16>()
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP status code")
+        })?;
+
+    let mut content_type = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-type")
+        {
+            content_type = Some(value.trim().to_string());
+        }
+    }
+
+    Ok(ProxyResponse {
+        status,
+        content_type,
+        body: body.to_vec(),
+    })
+}
+
+pub fn mac_for_name(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(name.as_bytes());
+    format!(
+        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        hash[0], hash[1], hash[2], hash[3], hash[4]
+    )
 }

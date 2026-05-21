@@ -135,13 +135,18 @@ async fn run_slot_smoke(pool: &ProcessPool) -> io::Result<()> {
     println!("smoke: initial slot0 state={:?}", initial.state);
 
     let booting = pool
-        .reserve_vm_slot(0, "smoke-owner".to_string())
+        .reserve_vm_slot(
+            0,
+            "smoke-owner".to_string(),
+            "02:00:00:00:00:00".to_string(),
+            "tap0".to_string(),
+        )
         .await
         .map_err(io::Error::other)?;
     println!("smoke: after reserve slot0 state={:?}", booting.state);
 
     let occupied = pool
-        .mark_vm_slot_booted(0)
+        .mark_vm_slot_booted(0, chrono::Utc::now().to_rfc3339())
         .await
         .map_err(io::Error::other)?;
     println!("smoke: after mark_booted slot0 state={:?}", occupied.state);
