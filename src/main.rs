@@ -32,7 +32,12 @@ struct Cli {
     )]
     pool_size: usize,
 
-    #[arg(long, default_value = "/tmp", help = "Path to the VM data directory")]
+    #[arg(
+        long,
+        name = "runtime-dir",
+        default_value = "/tmp",
+        help = "Path to the VM data directory"
+    )]
     vm_path: PathBuf,
 
     #[arg(long, default_value = "127.0.0.1:7777", help = "REST listen address")]
