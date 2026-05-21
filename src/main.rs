@@ -1,9 +1,13 @@
 use std::ffi::OsString;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
+use tokio::sync::Mutex;
 
+mod api;
 mod pool;
 use pool::ProcessPool;
 
@@ -30,6 +34,9 @@ struct Cli {
 
     #[arg(long, default_value = "/tmp", help = "Path to the VM data directory")]
     vm_path: PathBuf,
+
+    #[arg(long, default_value = "127.0.0.1:7777", help = "REST listen address")]
+    listen_addr: SocketAddr,
 }
 
 fn resolve_program_and_args() -> Result<(String, Vec<OsString>), String> {
@@ -100,15 +107,29 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    let shared_pool = Arc::new(Mutex::new(pool));
     println!(
-        "orchestrator pool is running with {} child processes",
-        pool.size()
+        "orchestrator pool is running with {} vmm slots",
+        shared_pool.lock().await.size(),
     );
 
-    wait_for_shutdown_signal().await?;
-    println!("shutdown signal received");
+    let app = api::router(shared_pool.clone());
+    let listener = tokio::net::TcpListener::bind(cli.listen_addr).await?;
 
-    pool.shutdown().await;
+    println!("listening on {}", cli.listen_addr);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = wait_for_shutdown_signal().await {
+                eprintln!("shutdown signal listener failed: {error}");
+            }
+        })
+        .await
+        .map_err(io::Error::other)?;
+
+    println!("shutdown signal received");
+    shared_pool.lock().await.shutdown().await;
+
     Ok(())
 }
 

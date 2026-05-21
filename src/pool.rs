@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use tokio::{
     io,
     process::{Child, Command},
@@ -13,7 +14,7 @@ pub struct ProcessPool {
     slots: Vec<SlotHandle>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SlotState {
     Empty,
     Booting,
@@ -21,7 +22,7 @@ pub enum SlotState {
     Failed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SlotStatus {
     pub slot: usize,
     pub generation: u64,
