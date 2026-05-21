@@ -11,7 +11,6 @@ mod api;
 mod pool;
 use pool::ProcessPool;
 
-const ENV_PROGRAM: &str = "CLOUD_HYPERVISOR";
 const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";
 
 #[derive(Debug, Parser)]
@@ -32,25 +31,18 @@ struct Cli {
     )]
     pool_size: usize,
 
-    #[arg(
-        long,
-        name = "runtime-dir",
-        default_value = "/tmp",
-        help = "Path to the VM data directory"
-    )]
-    vm_path: PathBuf,
+    #[arg(long, default_value = "/tmp", help = "Path to the VM data directory")]
+    runtime_dir: PathBuf,
+
+    #[arg(long, help = "Cloud Hypervisor binary path")]
+    ch_bin: String,
 
     #[arg(long, default_value = "127.0.0.1:7777", help = "REST listen address")]
     listen_addr: SocketAddr,
 }
 
-fn resolve_program_and_args() -> Result<(String, Vec<OsString>), String> {
-    let program = std::env::var(ENV_PROGRAM).map_err(|_| {
-        format!("missing {ENV_PROGRAM}: set it to the cloud-hypervisor executable path")
-    })?;
-
+fn resolve_program_and_args(program: String) -> Result<(String, Vec<OsString>), String> {
     let args = parse_env_args()?;
-
     Ok((program, args))
 }
 
@@ -101,10 +93,10 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    let (program, args) = resolve_program_and_args().map_err(io::Error::other)?;
-    std::fs::create_dir_all(&cli.vm_path)?;
+    let (program, args) = resolve_program_and_args(cli.ch_bin).map_err(io::Error::other)?;
+    std::fs::create_dir_all(&cli.runtime_dir)?;
 
-    let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.vm_path).await?;
+    let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
 
     if cli.smoke_slot {
         run_slot_smoke(&pool).await?;
