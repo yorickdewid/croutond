@@ -11,6 +11,7 @@ use axum::{
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -229,6 +230,10 @@ async fn create_vm(
             )));
         }
     }
+
+    drop(pool);
+    wait_for_slot_ready(&state, slot).await?;
+    let pool = state.pool.lock().await;
 
     let status = pool
         .mark_vm_slot_booted(slot, boot_started_at)
@@ -551,14 +556,15 @@ async fn wait_for_slot_ready(state: &AppState, slot: usize) -> Result<(), ApiErr
             .get_vm_slot_status(slot)
             .await
             .map_err(map_pool_error)?;
-        let socket_exists = pool.vm_socket_path(slot).exists();
-        let ready = status.pid.is_some() && socket_exists;
-
-        if ready {
-            return Ok(());
-        }
+        let socket_path = pool.vm_socket_path(slot);
+        let has_pid = status.pid.is_some();
 
         drop(pool);
+
+        // File existence can race; a successful connect confirms the server socket is usable.
+        if has_pid && UnixStream::connect(&socket_path).await.is_ok() {
+            return Ok(());
+        }
 
         if start.elapsed() >= deadline {
             return Err(ApiError::Backend(format!(

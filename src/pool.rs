@@ -161,6 +161,11 @@ fn initialize_slot(
 }
 
 impl ProcessPool {
+    /// Creates a new process pool and starts one worker per slot.
+    ///
+    /// Each worker is configured with its own API socket under `vm_path` and
+    /// receives the supplied program arguments plus the slot-specific socket
+    /// path.
     pub async fn spawn(
         pool_size: usize,
         program: &str,
