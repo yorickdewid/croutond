@@ -19,9 +19,6 @@ const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";
     about = "Crouton virtual machine orchestrator daemon"
 )]
 struct Cli {
-    #[arg(long, help = "Run a VM slot smoke test and exit")]
-    smoke_slot: bool,
-
     #[arg(
         short,
         long,
@@ -96,13 +93,7 @@ async fn main() -> io::Result<()> {
     let (program, args) = resolve_program_and_args(cli.ch_bin).map_err(io::Error::other)?;
     std::fs::create_dir_all(&cli.runtime_dir)?;
 
-    let mut pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
-
-    if cli.smoke_slot {
-        run_slot_smoke(&pool).await?;
-        pool.shutdown().await;
-        return Ok(());
-    }
+    let pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
 
     let shared_pool = Arc::new(Mutex::new(pool));
     println!(
@@ -126,33 +117,6 @@ async fn main() -> io::Result<()> {
 
     println!("shutdown signal received");
     shared_pool.lock().await.shutdown().await;
-
-    Ok(())
-}
-
-async fn run_slot_smoke(pool: &ProcessPool) -> io::Result<()> {
-    let initial = pool.get_vm_slot_status(0).await.map_err(io::Error::other)?;
-    println!("smoke: initial slot0 state={:?}", initial.state);
-
-    let booting = pool
-        .reserve_vm_slot(
-            0,
-            "smoke-owner".to_string(),
-            "02:00:00:00:00:00".to_string(),
-            "tap0".to_string(),
-        )
-        .await
-        .map_err(io::Error::other)?;
-    println!("smoke: after reserve slot0 state={:?}", booting.state);
-
-    let occupied = pool
-        .mark_vm_slot_booted(0, chrono::Utc::now().to_rfc3339())
-        .await
-        .map_err(io::Error::other)?;
-    println!("smoke: after mark_booted slot0 state={:?}", occupied.state);
-
-    let empty = pool.release_vm_slot(0).await.map_err(io::Error::other)?;
-    println!("smoke: after release slot0 state={:?}", empty.state);
 
     Ok(())
 }
