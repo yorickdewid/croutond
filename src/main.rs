@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
 
 mod api;
 mod pool;
+mod service;
 use pool::ProcessPool;
 
 const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";
@@ -34,7 +36,7 @@ struct Cli {
     #[arg(long, help = "Cloud Hypervisor binary path")]
     ch_bin: String,
 
-    #[arg(long, default_value = "127.0.0.1:7777", help = "REST listen address")]
+    #[arg(long, default_value = "[::]:7777", help = "REST listen address")]
     listen_addr: SocketAddr,
 }
 
@@ -70,6 +72,24 @@ fn parse_pool_size(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+async fn bind_listener(listen_addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
+    match listen_addr {
+        SocketAddr::V4(_) => Ok(tokio::net::TcpListener::bind(listen_addr).await?),
+        SocketAddr::V6(ipv6_addr) if ipv6_addr.ip().is_unspecified() => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_only_v6(false)?;
+            socket.bind(&listen_addr.into())?;
+            socket.listen(1024)?;
+
+            let listener = std::net::TcpListener::from(socket);
+            listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(listener)
+        }
+        SocketAddr::V6(_) => Ok(tokio::net::TcpListener::bind(listen_addr).await?),
+    }
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -102,9 +122,9 @@ async fn main() -> io::Result<()> {
     );
 
     let app = api::router(shared_pool.clone());
-    let listener = tokio::net::TcpListener::bind(cli.listen_addr).await?;
+    let listener = bind_listener(cli.listen_addr).await?;
 
-    println!("listening on {}", cli.listen_addr);
+    println!("listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
