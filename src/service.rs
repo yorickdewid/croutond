@@ -294,8 +294,8 @@ fn create_restore_request_body(config: &BootConfig) -> serde_json::Value {
 fn disk_image_type(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
-        "qcow2" | "qcow" => Some("qcow2"),
-        "raw" => Some("raw"),
+        "qcow2" | "qcow" => Some("Qcow2"),
+        "raw" => Some("Raw"),
         _ => None,
     }
 }
