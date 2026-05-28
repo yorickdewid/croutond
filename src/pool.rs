@@ -523,10 +523,15 @@ async fn supervise_slot(
                     match runtime.status.state {
                         SlotState::Empty => {}
                         SlotState::Booting | SlotState::Occupied => {
-                            runtime.status.state = SlotState::Failed;
-                            runtime.status.last_error =
-                                Some("vm process exited unexpectedly".to_string());
+                            // Treat guest shutdown/exit as a terminal VM lifecycle event and
+                            // return the slot to the reusable pool.
+                            runtime.status.state = SlotState::Empty;
+                            runtime.status.name = None;
+                            runtime.status.mac = None;
+                            runtime.status.tap = None;
                             runtime.status.started_at = None;
+                            runtime.status.last_error = None;
+                            runtime.status.generation += 1;
                         }
                         SlotState::Failed => {}
                     }
