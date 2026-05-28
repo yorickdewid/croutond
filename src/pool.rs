@@ -1,11 +1,15 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use axum::http::Method;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, body::Incoming, client::conn::http1, header};
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
@@ -728,81 +732,64 @@ async fn send_unix_http_request(
     body: Vec<u8>,
     content_type: Option<&str>,
 ) -> std::io::Result<ProxyResponse> {
-    let mut stream = UnixStream::connect(socket_path).await?;
-    let mut request = format!(
-        "{} {} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n",
-        method.as_str(),
-        path,
-        body.len()
-    );
+    let stream = UnixStream::connect(socket_path).await?;
+    let io = TokioIo::new(stream);
 
-    if let Some(content_type) = content_type {
-        request.push_str(&format!("content-type: {content_type}\r\n"));
+    let (mut sender, connection) = http1::handshake(io).await.map_err(io_other)?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("hyper client connection error: {error}");
+        }
+    });
+
+    let uri = if path.is_empty() { "/" } else { path };
+    let mut request_builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "localhost")
+        .header(header::CONNECTION, "close");
+
+    if let Some(value) = content_type {
+        request_builder = request_builder.header(header::CONTENT_TYPE, value);
     }
 
-    request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).await?;
-    if !body.is_empty() {
-        stream.write_all(&body).await?;
-    }
-    stream.shutdown().await?;
+    let request = request_builder
+        .body(Full::new(Bytes::from(body)))
+        .map_err(io_invalid_input)?;
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-
-    parse_http_response(response)
+    let response = sender.send_request(request).await.map_err(io_other)?;
+    response_to_proxy_response(response).await
 }
 
-fn parse_http_response(response: Vec<u8>) -> std::io::Result<ProxyResponse> {
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing HTTP header terminator",
-            )
-        })?;
+async fn response_to_proxy_response(
+    response: hyper::Response<Incoming>,
+) -> io::Result<ProxyResponse> {
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
 
-    let (header_bytes, body) = response.split_at(split + 4);
-    let header_text = String::from_utf8_lossy(header_bytes);
-    let mut lines = header_text.lines();
-    let status_line = lines.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing HTTP status line")
-    })?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP status line")
-        })?
-        .parse::<u16>()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP status code")
-        })?;
-
-    let mut content_type = None;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-type")
-        {
-            content_type = Some(value.trim().to_string());
-        }
-    }
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(io_other)?
+        .to_bytes()
+        .to_vec();
 
     Ok(ProxyResponse {
         status,
         content_type,
-        body: body.to_vec(),
+        body,
     })
 }
 
-pub fn mac_for_name(name: &str) -> String {
-    use sha2::{Digest, Sha256};
+fn io_other(error: impl fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
 
-    let hash = Sha256::digest(name.as_bytes());
-    format!(
-        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        hash[0], hash[1], hash[2], hash[3], hash[4]
-    )
+fn io_invalid_input(error: impl fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }

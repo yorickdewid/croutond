@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -11,11 +10,10 @@ use axum::{
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
-use crate::pool::{PoolError, ProcessPool, SlotState, VmRuntime, VmState, mac_for_name};
+use crate::pool::{PoolError, ProcessPool, SlotState, VmRuntime};
+use crate::service;
 
 pub type SharedPool = Arc<Mutex<ProcessPool>>;
 
@@ -45,17 +43,17 @@ struct ErrorResponse {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BootConfig {
-    name: String,
-    cpus: u16,
-    memory_mb: u64,
-    boot_mode: String,
-    disks: Vec<PathBuf>,
-    kernel_path: Option<PathBuf>,
-    initrd_path: Option<PathBuf>,
-    cmdline: Option<String>,
-    firmware_path: Option<PathBuf>,
-    snapshot_path: Option<PathBuf>,
+pub(crate) struct BootConfig {
+    pub(crate) name: String,
+    pub(crate) cpus: u16,
+    pub(crate) memory_mb: u64,
+    pub(crate) boot_mode: String,
+    pub(crate) disks: Vec<PathBuf>,
+    pub(crate) kernel_path: Option<PathBuf>,
+    pub(crate) initrd_path: Option<PathBuf>,
+    pub(crate) cmdline: Option<String>,
+    pub(crate) firmware_path: Option<PathBuf>,
+    pub(crate) snapshot_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -77,7 +75,7 @@ struct ListResponse {
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
 #[derive(Debug)]
-enum ApiError {
+pub(crate) enum ApiError {
     Validation {
         field: Option<String>,
         error: String,
@@ -162,131 +160,14 @@ async fn create_vm(
     State(state): State<AppState>,
     Json(payload): Json<BootConfig>,
 ) -> ApiResult<VmRuntime> {
-    validate_boot_config(&payload)?;
-
-    let name = payload.name.clone();
-    let mac = mac_for_name(&name);
-
-    let reserved = {
-        let pool = state.pool.lock().await;
-        pool.allocate_vm_slot(name.clone(), mac.clone())
-            .await
-            .map_err(map_pool_error)?
-    };
-
-    let slot = reserved.slot;
-    wait_for_slot_ready(&state, slot).await?;
-
-    let boot_started_at = boot_started_at();
-    let proxy_body = serde_json::to_vec(&create_request_body(&payload, &reserved, slot))
-        .map_err(|error| ApiError::Backend(error.to_string()))?;
-
-    let pool = state.pool.lock().await;
-    let create_path = if payload.snapshot_path.is_some() {
-        "/vm.restore"
-    } else {
-        "/vm.create"
-    };
-
-    let create_response = pool
-        .proxy_vm_request_with_content_type(
-            slot,
-            Method::PUT,
-            create_path,
-            proxy_body,
-            Some("application/json"),
-        )
-        .await
-        .map_err(map_pool_error)?;
-
-    if create_response.status >= 400 {
-        drop(pool);
-        cleanup_reserved_vm(&state, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            create_response.status
-        )));
-    }
-
-    if payload.snapshot_path.is_none() {
-        let boot_response = pool
-            .proxy_vm_request_with_content_type(
-                slot,
-                Method::PUT,
-                "/vm.boot",
-                serde_json::to_vec(&serde_json::json!({"name": payload.name}))
-                    .map_err(|error| ApiError::Backend(error.to_string()))?,
-                Some("application/json"),
-            )
-            .await
-            .map_err(map_pool_error)?;
-
-        if boot_response.status >= 400 {
-            drop(pool);
-            cleanup_reserved_vm(&state, slot).await;
-            return Err(ApiError::Backend(format!(
-                "backend returned status {}",
-                boot_response.status
-            )));
-        }
-    }
-
-    drop(pool);
-    wait_for_slot_ready(&state, slot).await?;
-    let pool = state.pool.lock().await;
-
-    let status = pool
-        .mark_vm_slot_booted(slot, boot_started_at)
-        .await
-        .map_err(map_pool_error)?;
-
-    Ok(Json((&status).try_into().map_err(map_pool_error)?))
+    Ok(Json(service::create_vm(&state.pool, payload).await?))
 }
 
 async fn delete_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    let pool = state.pool.lock().await;
-    let status = pool
-        .find_vm_slot_status_by_name(&name)
-        .await
-        .map_err(map_pool_error)?
-        .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
-
-    if status.state != SlotState::Occupied {
-        return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
-    }
-
-    let slot = status.slot;
-    let shutdown = pool
-        .proxy_vm_request_with_content_type(slot, Method::PUT, "/vm.shutdown", Vec::new(), None)
-        .await
-        .map_err(map_pool_error)?;
-    if shutdown.status >= 400 {
-        drop(pool);
-        cleanup_reserved_vm(&state, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            shutdown.status
-        )));
-    }
-
-    let delete = pool
-        .proxy_vm_request_with_content_type(slot, Method::PUT, "/vm.delete", Vec::new(), None)
-        .await
-        .map_err(map_pool_error)?;
-    if delete.status >= 400 {
-        drop(pool);
-        cleanup_reserved_vm(&state, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            delete.status
-        )));
-    }
-
-    let _ = pool.release_vm_slot(slot).await.map_err(map_pool_error)?;
-
+    service::delete_vm(&state.pool, &name).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -341,7 +222,7 @@ async fn proxy_counters(
     proxy_passthrough_by_name(&state, &name, "/vm.counters").await
 }
 
-fn map_pool_error(error: PoolError) -> ApiError {
+pub(crate) fn map_pool_error(error: PoolError) -> ApiError {
     match error {
         PoolError::SlotNotFound(slot) => ApiError::NotFound(format!("slot {slot} does not exist")),
         PoolError::VmNotFound(name) => ApiError::NotFound(format!("VM '{name}' not found")),
@@ -354,126 +235,6 @@ fn map_pool_error(error: PoolError) -> ApiError {
         )),
         PoolError::ChannelClosed => ApiError::Backend("slot worker channel is closed".to_string()),
         PoolError::Backend(error) => ApiError::Backend(error),
-    }
-}
-
-fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
-    if config.name.trim().is_empty() {
-        return Err(ApiError::Validation {
-            field: Some("name".to_string()),
-            error: "name is required".to_string(),
-        });
-    }
-
-    if config.cpus == 0 {
-        return Err(ApiError::Validation {
-            field: Some("cpus".to_string()),
-            error: "cpus must be greater than zero".to_string(),
-        });
-    }
-
-    if config.memory_mb == 0 {
-        return Err(ApiError::Validation {
-            field: Some("memoryMb".to_string()),
-            error: "memoryMb must be greater than zero".to_string(),
-        });
-    }
-
-    if config.boot_mode.trim().is_empty() {
-        return Err(ApiError::Validation {
-            field: Some("bootMode".to_string()),
-            error: "bootMode is required".to_string(),
-        });
-    }
-
-    for disk in &config.disks {
-        if !disk.is_absolute() {
-            return Err(ApiError::Validation {
-                field: Some("disks".to_string()),
-                error: format!("disk path '{}' must be absolute", disk.display()),
-            });
-        }
-    }
-
-    for (field, path) in [
-        ("kernelPath", config.kernel_path.as_ref()),
-        ("initrdPath", config.initrd_path.as_ref()),
-        ("firmwarePath", config.firmware_path.as_ref()),
-        ("snapshotPath", config.snapshot_path.as_ref()),
-    ] {
-        if let Some(path) = path
-            && !path.is_absolute()
-        {
-            return Err(ApiError::Validation {
-                field: Some(field.to_string()),
-                error: format!("{field} must be absolute"),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn create_request_body(
-    config: &BootConfig,
-    reserved: &crate::pool::SlotStatus,
-    slot: usize,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": config.name,
-        "cpus": config.cpus,
-        "memoryMb": config.memory_mb,
-        "bootMode": config.boot_mode,
-        "disks": config.disks,
-        "kernelPath": config.kernel_path,
-        "initrdPath": config.initrd_path,
-        "cmdline": config.cmdline,
-        "firmwarePath": config.firmware_path,
-        "snapshotPath": config.snapshot_path,
-        "slot": slot,
-        "tap": reserved.tap,
-        "mac": reserved.mac,
-    })
-}
-
-fn boot_started_at() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-impl TryFrom<&crate::pool::SlotStatus> for VmRuntime {
-    type Error = PoolError;
-
-    fn try_from(status: &crate::pool::SlotStatus) -> Result<Self, Self::Error> {
-        if status.state != SlotState::Occupied {
-            return Err(PoolError::InvalidTransition {
-                slot: status.slot,
-                from: status.state,
-                action: "convert_runtime",
-            });
-        }
-
-        Ok(Self {
-            name: status
-                .name
-                .clone()
-                .ok_or_else(|| PoolError::Backend("missing VM name".to_string()))?,
-            mac: status
-                .mac
-                .clone()
-                .ok_or_else(|| PoolError::Backend("missing MAC address".to_string()))?,
-            tap: status
-                .tap
-                .clone()
-                .ok_or_else(|| PoolError::Backend("missing tap device".to_string()))?,
-            pid: status
-                .pid
-                .ok_or_else(|| PoolError::Backend("missing pid".to_string()))?,
-            state: VmState::Running,
-            started_at: status
-                .started_at
-                .clone()
-                .ok_or_else(|| PoolError::Backend("missing started_at".to_string()))?,
-        })
     }
 }
 
@@ -552,39 +313,4 @@ async fn proxy_passthrough_by_name(
     builder
         .body(Body::from(response.body))
         .map_err(|error| ApiError::Backend(error.to_string()))
-}
-
-async fn wait_for_slot_ready(state: &AppState, slot: usize) -> Result<(), ApiError> {
-    let deadline = Duration::from_secs(5);
-    let start = tokio::time::Instant::now();
-
-    loop {
-        let pool = state.pool.lock().await;
-        let status = pool
-            .get_vm_slot_status(slot)
-            .await
-            .map_err(map_pool_error)?;
-        let socket_path = pool.vm_socket_path(slot);
-        let has_pid = status.pid.is_some();
-
-        drop(pool);
-
-        // File existence can race; a successful connect confirms the server socket is usable.
-        if has_pid && UnixStream::connect(&socket_path).await.is_ok() {
-            return Ok(());
-        }
-
-        if start.elapsed() >= deadline {
-            return Err(ApiError::Backend(format!(
-                "slot {slot} did not become ready"
-            )));
-        }
-
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn cleanup_reserved_vm(state: &AppState, slot: usize) {
-    let pool = state.pool.lock().await;
-    let _ = pool.reset_vm_slot(slot).await;
 }
