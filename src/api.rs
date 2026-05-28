@@ -240,7 +240,7 @@ async fn create_vm(
         .await
         .map_err(map_pool_error)?;
 
-    Ok(Json(vm_runtime_from_status(&status)?))
+    Ok(Json((&status).try_into().map_err(map_pool_error)?))
 }
 
 async fn delete_vm(
@@ -440,33 +440,41 @@ fn boot_started_at() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn vm_runtime_from_status(status: &crate::pool::SlotStatus) -> Result<VmRuntime, ApiError> {
-    if status.state != SlotState::Occupied {
-        return Err(ApiError::Conflict("VM is not running".to_string()));
-    }
+impl TryFrom<&crate::pool::SlotStatus> for VmRuntime {
+    type Error = PoolError;
 
-    Ok(VmRuntime {
-        name: status
-            .name
-            .clone()
-            .ok_or_else(|| ApiError::Backend("missing VM name".to_string()))?,
-        mac: status
-            .mac
-            .clone()
-            .ok_or_else(|| ApiError::Backend("missing MAC address".to_string()))?,
-        tap: status
-            .tap
-            .clone()
-            .ok_or_else(|| ApiError::Backend("missing tap device".to_string()))?,
-        pid: status
-            .pid
-            .ok_or_else(|| ApiError::Backend("missing pid".to_string()))?,
-        state: VmState::Running,
-        started_at: status
-            .started_at
-            .clone()
-            .ok_or_else(|| ApiError::Backend("missing started_at".to_string()))?,
-    })
+    fn try_from(status: &crate::pool::SlotStatus) -> Result<Self, Self::Error> {
+        if status.state != SlotState::Occupied {
+            return Err(PoolError::InvalidTransition {
+                slot: status.slot,
+                from: status.state,
+                action: "convert_runtime",
+            });
+        }
+
+        Ok(Self {
+            name: status
+                .name
+                .clone()
+                .ok_or_else(|| PoolError::Backend("missing VM name".to_string()))?,
+            mac: status
+                .mac
+                .clone()
+                .ok_or_else(|| PoolError::Backend("missing MAC address".to_string()))?,
+            tap: status
+                .tap
+                .clone()
+                .ok_or_else(|| PoolError::Backend("missing tap device".to_string()))?,
+            pid: status
+                .pid
+                .ok_or_else(|| PoolError::Backend("missing pid".to_string()))?,
+            state: VmState::Running,
+            started_at: status
+                .started_at
+                .clone()
+                .ok_or_else(|| PoolError::Backend("missing started_at".to_string()))?,
+        })
+    }
 }
 
 async fn proxy_action_by_name(
