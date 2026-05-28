@@ -115,12 +115,12 @@ async fn main() -> io::Result<()> {
 
     let pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
 
-    let shared_pool = Arc::new(Mutex::new(pool));
     println!(
         "orchestrator pool is running with {} vmm slots",
-        shared_pool.lock().await.size(),
+        pool.size()
     );
 
+    let shared_pool = Arc::new(Mutex::new(pool));
     let app = api::router(shared_pool.clone());
     let listener = bind_listener(cli.listen_addr).await?;
 
