@@ -16,6 +16,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tun::TunBuilder;
+use tracing::{error, info, warn};
 
 pub struct ProcessPool {
     shutdown_tx: watch::Sender<bool>,
@@ -431,12 +432,12 @@ impl ProcessPool {
 
     pub async fn shutdown(&mut self) {
         if self.shutdown_tx.send(true).is_err() {
-            eprintln!("failed to broadcast shutdown to workers");
+            warn!("failed to broadcast shutdown to workers");
         }
 
         while let Some(slot) = self.slots.pop() {
             if let Err(error) = slot.worker.await {
-                eprintln!("worker task failed during shutdown: {error}");
+                error!(%error, "worker task failed during shutdown");
             }
         }
     }
@@ -493,18 +494,14 @@ async fn supervise_slot(
                 Ok(child) => {
                     runtime.status.pid = child.id();
                     runtime.status.last_error = None;
-                    println!(
-                        "spawned vmm {} with pid {:?}",
-                        slot,
-                        runtime.status.pid.unwrap_or(0)
-                    );
+                    info!(slot, pid = runtime.status.pid.unwrap_or(0), "spawned vmm");
                     runtime.child = Some(child);
                 }
                 Err(error) => {
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
                     runtime.status.pid = None;
-                    eprintln!("vmm {} failed to spawn child: {error}", slot);
+                    error!(slot, %error, "vmm failed to spawn child");
                 }
             }
         }
@@ -519,7 +516,7 @@ async fn supervise_slot(
                     runtime.child = None;
                     runtime.status.pid = None;
                     cleanup_api_socket(&api_socket);
-                    println!("vmm {} exited with status {}", slot, status);
+                    info!(slot, %status, "vmm exited");
 
                     match runtime.status.state {
                         SlotState::Empty => {}
@@ -544,7 +541,7 @@ async fn supervise_slot(
                     runtime.status.state = SlotState::Failed;
                     runtime.status.last_error = Some(error.to_string());
                     cleanup_api_socket(&api_socket);
-                    eprintln!("vmm {} failed while polling exit: {error}", slot);
+                    error!(slot, %error, "vmm failed while polling exit");
                 }
             }
         }
@@ -697,16 +694,16 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
 
 async fn stop_child(child: &mut Child) {
     if let Some(pid) = child.id() {
-        println!("stopping child with pid {}", pid);
+        info!(pid, "stopping child");
     }
 
     if let Err(error) = child.start_kill() {
-        eprintln!("failed to signal child for shutdown: {error}");
+        warn!(%error, "failed to signal child for shutdown");
         return;
     }
 
     if let Err(error) = child.wait().await {
-        eprintln!("failed while waiting for child shutdown: {error}");
+        warn!(%error, "failed while waiting for child shutdown");
     }
 }
 
@@ -714,10 +711,7 @@ fn cleanup_api_socket(api_socket: &Path) {
     match std::fs::remove_file(api_socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => eprintln!(
-            "failed to remove api socket {}: {error}",
-            api_socket.display()
-        ),
+        Err(error) => warn!(path = %api_socket.display(), %error, "failed to remove api socket"),
     }
 }
 
@@ -749,7 +743,7 @@ async fn send_unix_http_request(
     let (mut sender, connection) = http1::handshake(io).await.map_err(io_other)?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("hyper client connection error: {error}");
+            warn!(%error, "hyper client connection error");
         }
     });
 

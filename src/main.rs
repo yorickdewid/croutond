@@ -7,6 +7,8 @@ use std::sync::Arc;
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 mod api;
 mod pool;
@@ -72,6 +74,16 @@ fn parse_pool_size(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn init_logging() {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("croutond=info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .init();
+}
+
 async fn bind_listener(listen_addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     match listen_addr {
         SocketAddr::V4(_) => Ok(tokio::net::TcpListener::bind(listen_addr).await?),
@@ -109,33 +121,32 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    init_logging();
+
     let cli = Cli::parse();
     let (program, args) = resolve_program_and_args(cli.ch_bin).map_err(io::Error::other)?;
     std::fs::create_dir_all(&cli.runtime_dir)?;
 
     let pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
 
-    println!(
-        "orchestrator pool is running with {} vmm slots",
-        pool.size()
-    );
+    info!(slots = pool.size(), "orchestrator pool is running");
 
     let shared_pool = Arc::new(Mutex::new(pool));
     let app = api::router(shared_pool.clone());
     let listener = bind_listener(cli.listen_addr).await?;
 
-    println!("listening on {}", listener.local_addr()?);
+    info!(address = %listener.local_addr()?, "listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             if let Err(error) = wait_for_shutdown_signal().await {
-                eprintln!("shutdown signal listener failed: {error}");
+                error!(%error, "shutdown signal listener failed");
             }
         })
         .await
         .map_err(io::Error::other)?;
 
-    println!("shutdown signal received");
+    info!("shutdown signal received");
     shared_pool.lock().await.shutdown().await;
 
     Ok(())
