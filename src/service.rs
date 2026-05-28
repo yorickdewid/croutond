@@ -5,7 +5,7 @@ use tokio::net::UnixStream;
 use tokio::time::sleep;
 
 use crate::api::{ApiError, BootConfig, SharedPool, map_pool_error};
-use crate::pool::{PoolError, SlotState, VmRuntime, VmState};
+use crate::pool::{PoolError, ProxyResponse, SlotState, VmRuntime, VmState};
 
 pub(crate) async fn create_vm(
     pool: &SharedPool,
@@ -27,8 +27,13 @@ pub(crate) async fn create_vm(
     wait_for_slot_ready(pool, slot).await?;
 
     let boot_started_at = boot_started_at();
-    let proxy_body = serde_json::to_vec(&create_request_body(&payload, &reserved, slot))
-        .map_err(|error| ApiError::Backend(error.to_string()))?;
+    let proxy_body = if payload.snapshot_path.is_some() {
+        serde_json::to_vec(&create_restore_request_body(&payload))
+            .map_err(|error| ApiError::Backend(error.to_string()))?
+    } else {
+        serde_json::to_vec(&create_vm_request_body(&payload, &reserved))
+            .map_err(|error| ApiError::Backend(error.to_string()))?
+    };
 
     let pool_guard = pool.lock().await;
     let create_path = if payload.snapshot_path.is_some() {
@@ -51,10 +56,7 @@ pub(crate) async fn create_vm(
     if create_response.status >= 400 {
         drop(pool_guard);
         cleanup_reserved_vm(pool, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            create_response.status
-        )));
+        return Err(ApiError::Backend(format_backend_error(&create_response)));
     }
 
     if payload.snapshot_path.is_none() {
@@ -63,9 +65,8 @@ pub(crate) async fn create_vm(
                 slot,
                 Method::PUT,
                 "/api/v1/vm.boot",
-                serde_json::to_vec(&serde_json::json!({"name": payload.name}))
-                    .map_err(|error| ApiError::Backend(error.to_string()))?,
-                Some("application/json"),
+                Vec::new(),
+                None,
             )
             .await
             .map_err(map_pool_error)?;
@@ -73,10 +74,7 @@ pub(crate) async fn create_vm(
         if boot_response.status >= 400 {
             drop(pool_guard);
             cleanup_reserved_vm(pool, slot).await;
-            return Err(ApiError::Backend(format!(
-                "backend returned status {}",
-                boot_response.status
-            )));
+            return Err(ApiError::Backend(format_backend_error(&boot_response)));
         }
     }
 
@@ -118,10 +116,7 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
     if shutdown.status >= 400 {
         drop(pool_guard);
         cleanup_reserved_vm(pool, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            shutdown.status
-        )));
+        return Err(ApiError::Backend(format_backend_error(&shutdown)));
     }
 
     let delete = pool_guard
@@ -137,10 +132,7 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
     if delete.status >= 400 {
         drop(pool_guard);
         cleanup_reserved_vm(pool, slot).await;
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            delete.status
-        )));
+        return Err(ApiError::Backend(format_backend_error(&delete)));
     }
 
     let _ = pool_guard
@@ -179,6 +171,37 @@ fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
         });
     }
 
+    let boot_mode = config.boot_mode.to_ascii_lowercase();
+    if boot_mode != "linux" && boot_mode != "uefi" {
+        return Err(ApiError::Validation {
+            field: Some("bootMode".to_string()),
+            error: "bootMode must be one of: linux, uefi".to_string(),
+        });
+    }
+
+    if config.memory_mb > (u64::MAX >> 20) {
+        return Err(ApiError::Validation {
+            field: Some("memoryMb".to_string()),
+            error: "memoryMb is too large".to_string(),
+        });
+    }
+
+    if config.snapshot_path.is_none() {
+        if boot_mode == "linux" && config.kernel_path.is_none() {
+            return Err(ApiError::Validation {
+                field: Some("kernelPath".to_string()),
+                error: "kernelPath is required when bootMode=linux".to_string(),
+            });
+        }
+
+        if boot_mode == "uefi" && config.firmware_path.is_none() {
+            return Err(ApiError::Validation {
+                field: Some("firmwarePath".to_string()),
+                error: "firmwarePath is required when bootMode=uefi".to_string(),
+            });
+        }
+    }
+
     for disk in &config.disks {
         if !disk.is_absolute() {
             return Err(ApiError::Validation {
@@ -207,26 +230,72 @@ fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn create_request_body(
+fn create_vm_request_body(
     config: &BootConfig,
     reserved: &crate::pool::SlotStatus,
-    slot: usize,
 ) -> serde_json::Value {
+    let boot_mode = config.boot_mode.to_ascii_lowercase();
+    let payload = if boot_mode == "uefi" {
+        serde_json::json!({
+            "firmware": config.firmware_path,
+        })
+    } else {
+        serde_json::json!({
+            "kernel": config.kernel_path,
+            "initramfs": config.initrd_path,
+            "cmdline": config.cmdline,
+        })
+    };
+
+    let disks: Vec<serde_json::Value> = config
+        .disks
+        .iter()
+        .map(|path| serde_json::json!({"path": path}))
+        .collect();
+
     serde_json::json!({
-        "name": config.name,
-        "cpus": config.cpus,
-        "memoryMb": config.memory_mb,
-        "bootMode": config.boot_mode,
-        "disks": config.disks,
-        "kernelPath": config.kernel_path,
-        "initrdPath": config.initrd_path,
-        "cmdline": config.cmdline,
-        "firmwarePath": config.firmware_path,
-        "snapshotPath": config.snapshot_path,
-        "slot": slot,
-        "tap": reserved.tap,
-        "mac": reserved.mac,
+        "cpus": {
+            "boot_vcpus": config.cpus,
+            "max_vcpus": config.cpus,
+        },
+        "memory": {
+            "size": config.memory_mb << 20,
+        },
+        "payload": payload,
+        "disks": disks,
+        "net": [{
+            "tap": reserved.tap,
+            "mac": reserved.mac,
+        }],
+        "rng": {
+            "src": "/dev/urandom",
+        }
     })
+}
+
+fn create_restore_request_body(config: &BootConfig) -> serde_json::Value {
+    let source_url = config
+        .snapshot_path
+        .as_ref()
+        .map(|path| format!("file://{}", path.display()));
+
+    serde_json::json!({
+        "source_url": source_url,
+    })
+}
+
+fn format_backend_error(response: &ProxyResponse) -> String {
+    if response.body.is_empty() {
+        return format!("backend returned status {}", response.status);
+    }
+
+    let body = String::from_utf8_lossy(&response.body);
+    let body = body.trim();
+    if body.is_empty() {
+        format!("backend returned status {}", response.status)
+    } else {
+        format!("backend returned status {}: {}", response.status, body)
+    }
 }
 
 fn boot_started_at() -> String {
