@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use axum::http::Method;
@@ -250,7 +251,13 @@ fn create_vm_request_body(
     let disks: Vec<serde_json::Value> = config
         .disks
         .iter()
-        .map(|path| serde_json::json!({"path": path}))
+        .map(|path| match disk_image_type(path) {
+            Some(image_type) => serde_json::json!({
+                "path": path,
+                "image_type": image_type,
+            }),
+            None => serde_json::json!({"path": path}),
+        })
         .collect();
 
     serde_json::json!({
@@ -282,6 +289,15 @@ fn create_restore_request_body(config: &BootConfig) -> serde_json::Value {
     serde_json::json!({
         "source_url": source_url,
     })
+}
+
+fn disk_image_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "qcow2" | "qcow" => Some("qcow2"),
+        "raw" => Some("raw"),
+        _ => None,
+    }
 }
 
 fn format_backend_error(response: &ProxyResponse) -> String {
