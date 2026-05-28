@@ -9,11 +9,9 @@ User=croutond
 Group=croutond
 EnvironmentFile=-/etc/default/croutond
 Environment=CLOUD_HYPERVISOR=/usr/bin/cloud-hypervisor
-Environment=CLOUD_HYPERVISOR_ARGS=
 Environment=CROUTOND_RUNTIME_DIR=/var/lib/croutond
-Environment=CROUTOND_LISTEN_ADDR=127.0.0.1:7777
 Environment=CROUTOND_POOL_SIZE=4
-ExecStart=/usr/local/bin/croutond --ch-bin "${CLOUD_HYPERVISOR}" --runtime-dir "${CROUTOND_RUNTIME_DIR}" --listen-addr "${CROUTOND_LISTEN_ADDR}" --pool-size "${CROUTOND_POOL_SIZE}"
+ExecStart=/usr/local/bin/croutond --ch-bin "${CLOUD_HYPERVISOR}" --runtime-dir "${CROUTOND_RUNTIME_DIR}" --pool-size "${CROUTOND_POOL_SIZE}"
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
