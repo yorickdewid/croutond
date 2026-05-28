@@ -15,6 +15,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
+use tokio_tun::TunBuilder;
 
 pub struct ProcessPool {
     shutdown_tx: watch::Sender<bool>,
@@ -593,14 +594,19 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
             response,
         } => {
             let result = if runtime.status.state == SlotState::Empty {
-                runtime.status.state = SlotState::Booting;
-                runtime.status.name = Some(name);
-                runtime.status.mac = Some(mac);
-                runtime.status.tap = Some(tap);
-                runtime.status.generation += 1;
-                runtime.status.last_error = None;
-                runtime.status.started_at = None;
-                Ok(runtime.status.clone())
+                match ensure_tap_device(&tap) {
+                    Ok(()) => {
+                        runtime.status.state = SlotState::Booting;
+                        runtime.status.name = Some(name);
+                        runtime.status.mac = Some(mac);
+                        runtime.status.tap = Some(tap);
+                        runtime.status.generation += 1;
+                        runtime.status.last_error = None;
+                        runtime.status.started_at = None;
+                        Ok(runtime.status.clone())
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 Err(PoolError::InvalidTransition {
                     slot: runtime.status.slot,
@@ -797,4 +803,21 @@ fn io_other(error: impl fmt::Display) -> io::Error {
 
 fn io_invalid_input(error: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn ensure_tap_device(name: &str) -> Result<(), PoolError> {
+    match TunBuilder::new().name(name).tap().persist().up().build() {
+        Ok(_) => Ok(()),
+        Err(error) if is_tap_exists_error(&error) => Ok(()),
+        Err(error) => Err(PoolError::Backend(format!(
+            "failed to create tap interface '{name}': {error}"
+        ))),
+    }
+}
+
+fn is_tap_exists_error(error: &tokio_tun::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("file exists")
+        || message.contains("already exists")
+        || message.contains("device or resource busy")
 }
