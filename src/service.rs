@@ -32,9 +32,9 @@ pub(crate) async fn create_vm(
 
     let pool_guard = pool.lock().await;
     let create_path = if payload.snapshot_path.is_some() {
-        "/vm.restore"
+        "/api/v1/vm.restore"
     } else {
-        "/vm.create"
+        "/api/v1/vm.create"
     };
 
     let create_response = pool_guard
@@ -62,7 +62,7 @@ pub(crate) async fn create_vm(
             .proxy_vm_request_with_content_type(
                 slot,
                 Method::PUT,
-                "/vm.boot",
+                "/api/v1/vm.boot",
                 serde_json::to_vec(&serde_json::json!({"name": payload.name}))
                     .map_err(|error| ApiError::Backend(error.to_string()))?,
                 Some("application/json"),
@@ -106,7 +106,13 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
 
     let slot = status.slot;
     let shutdown = pool_guard
-        .proxy_vm_request_with_content_type(slot, Method::PUT, "/vm.shutdown", Vec::new(), None)
+        .proxy_vm_request_with_content_type(
+            slot,
+            Method::PUT,
+            "/api/v1/vm.shutdown",
+            Vec::new(),
+            None,
+        )
         .await
         .map_err(map_pool_error)?;
     if shutdown.status >= 400 {
@@ -119,7 +125,13 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
     }
 
     let delete = pool_guard
-        .proxy_vm_request_with_content_type(slot, Method::PUT, "/vm.delete", Vec::new(), None)
+        .proxy_vm_request_with_content_type(
+            slot,
+            Method::PUT,
+            "/api/v1/vm.delete",
+            Vec::new(),
+            None,
+        )
         .await
         .map_err(map_pool_error)?;
     if delete.status >= 400 {

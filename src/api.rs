@@ -175,21 +175,21 @@ async fn reboot_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/vm.reboot").await
+    proxy_action_by_name(&state, &name, "/api/v1/vm.reboot").await
 }
 
 async fn pause_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/vm.pause").await
+    proxy_action_by_name(&state, &name, "/api/v1/vm.pause").await
 }
 
 async fn resume_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/vm.resume").await
+    proxy_action_by_name(&state, &name, "/api/v1/vm.resume").await
 }
 
 async fn snapshot_vm(
@@ -205,21 +205,21 @@ async fn snapshot_vm(
     }
 
     let body = serde_json::json!({"destPath": payload.dest_path});
-    proxy_action_by_name_with_body(&state, &name, "/vm.snapshot", body).await
+    proxy_action_by_name_with_body(&state, &name, "/api/v1/vm.snapshot", body).await
 }
 
 async fn proxy_info(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ApiError> {
-    proxy_passthrough_by_name(&state, &name, "/vm.info").await
+    proxy_passthrough_by_name(&state, &name, "/api/v1/vm.info").await
 }
 
 async fn proxy_counters(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ApiError> {
-    proxy_passthrough_by_name(&state, &name, "/vm.counters").await
+    proxy_passthrough_by_name(&state, &name, "/api/v1/vm.counters").await
 }
 
 pub(crate) fn map_pool_error(error: PoolError) -> ApiError {
