@@ -30,7 +30,6 @@ impl From<PoolError> for ApiError {
     fn from(error: PoolError) -> Self {
         match error {
             PoolError::SlotNotFound(slot) => Self::NotFound(format!("slot {slot} does not exist")),
-            PoolError::VmNotFound(name) => Self::NotFound(format!("VM '{name}' not found")),
             PoolError::VmAlreadyRunning(name) => {
                 Self::Conflict(format!("VM '{name}' is already running"))
             }

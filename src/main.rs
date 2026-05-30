@@ -19,6 +19,8 @@ mod pool;
 mod pool_facade;
 mod service;
 mod slot_supervisor;
+mod vm_payload;
+mod vm_validation;
 use pool::ProcessPool;
 
 const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";

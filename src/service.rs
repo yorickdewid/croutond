@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +11,10 @@ use tokio::time::sleep;
 use crate::error::ApiError;
 use crate::pool::{PoolError, ProxyResponse, SlotState, VmRuntime, VmState};
 use crate::pool_facade::PoolFacade;
+use crate::vm_payload::{
+    create_restore_request_body, create_vm_request_body, format_backend_error,
+};
+use crate::vm_validation::validate_boot_config;
 
 pub(crate) type SharedPool = Arc<RwLock<crate::pool::ProcessPool>>;
 
@@ -31,6 +35,13 @@ pub(crate) struct BootConfig {
 
 pub(crate) async fn create_vm(
     pool: &SharedPool,
+    payload: BootConfig,
+) -> Result<VmRuntime, ApiError> {
+    create_vm_with_pool(pool, payload).await
+}
+
+async fn create_vm_with_pool<P: PoolFacade>(
+    pool: &Arc<RwLock<P>>,
     payload: BootConfig,
 ) -> Result<VmRuntime, ApiError> {
     validate_boot_config(&payload)?;
@@ -100,6 +111,13 @@ pub(crate) async fn create_vm(
 }
 
 pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiError> {
+    delete_vm_with_pool(pool, name).await
+}
+
+async fn delete_vm_with_pool<P: PoolFacade>(
+    pool: &Arc<RwLock<P>>,
+    name: &str,
+) -> Result<(), ApiError> {
     let pool_guard = pool.read().await;
     let status = pool_guard
         .find_slot_by_name(name)
@@ -147,6 +165,15 @@ pub(crate) async fn proxy_action_by_name_with_body(
     path: &str,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
+    proxy_action_by_name_with_body_for_pool(pool, name, path, body).await
+}
+
+async fn proxy_action_by_name_with_body_for_pool<P: PoolFacade>(
+    pool: &Arc<RwLock<P>>,
+    name: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<(), ApiError> {
     let pool_guard = pool.read().await;
     let status = pool_guard
         .find_slot_by_name(name)
@@ -179,6 +206,14 @@ pub(crate) async fn proxy_passthrough_by_name(
     name: &str,
     path: &str,
 ) -> Result<ProxyResponse, ApiError> {
+    proxy_passthrough_by_name_for_pool(pool, name, path).await
+}
+
+async fn proxy_passthrough_by_name_for_pool<P: PoolFacade>(
+    pool: &Arc<RwLock<P>>,
+    name: &str,
+    path: &str,
+) -> Result<ProxyResponse, ApiError> {
     let pool_guard = pool.read().await;
     let status = pool_guard
         .find_slot_by_name(name)
@@ -193,177 +228,6 @@ pub(crate) async fn proxy_passthrough_by_name(
         .request(status.slot, Method::GET, path, Vec::new())
         .await
         .map_err(ApiError::from)
-}
-
-fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
-    if config.name.trim().is_empty() {
-        return Err(ApiError::Validation {
-            field: Some("name".to_string()),
-            error: "name is required".to_string(),
-        });
-    }
-
-    if config.cpus == 0 {
-        return Err(ApiError::Validation {
-            field: Some("cpus".to_string()),
-            error: "cpus must be greater than zero".to_string(),
-        });
-    }
-
-    if config.memory_mb == 0 {
-        return Err(ApiError::Validation {
-            field: Some("memoryMb".to_string()),
-            error: "memoryMb must be greater than zero".to_string(),
-        });
-    }
-
-    if config.boot_mode.trim().is_empty() {
-        return Err(ApiError::Validation {
-            field: Some("bootMode".to_string()),
-            error: "bootMode is required".to_string(),
-        });
-    }
-
-    let boot_mode = config.boot_mode.to_ascii_lowercase();
-    if boot_mode != "linux" && boot_mode != "uefi" {
-        return Err(ApiError::Validation {
-            field: Some("bootMode".to_string()),
-            error: "bootMode must be one of: linux, uefi".to_string(),
-        });
-    }
-
-    if config.memory_mb > (u64::MAX >> 20) {
-        return Err(ApiError::Validation {
-            field: Some("memoryMb".to_string()),
-            error: "memoryMb is too large".to_string(),
-        });
-    }
-
-    if config.snapshot_path.is_none() {
-        if boot_mode == "linux" && config.kernel_path.is_none() {
-            return Err(ApiError::Validation {
-                field: Some("kernelPath".to_string()),
-                error: "kernelPath is required when bootMode=linux".to_string(),
-            });
-        }
-
-        if boot_mode == "uefi" && config.firmware_path.is_none() {
-            return Err(ApiError::Validation {
-                field: Some("firmwarePath".to_string()),
-                error: "firmwarePath is required when bootMode=uefi".to_string(),
-            });
-        }
-    }
-
-    for disk in &config.disks {
-        if !disk.is_absolute() {
-            return Err(ApiError::Validation {
-                field: Some("disks".to_string()),
-                error: format!("disk path '{}' must be absolute", disk.display()),
-            });
-        }
-    }
-
-    for (field, path) in [
-        ("kernelPath", config.kernel_path.as_ref()),
-        ("initrdPath", config.initrd_path.as_ref()),
-        ("firmwarePath", config.firmware_path.as_ref()),
-        ("snapshotPath", config.snapshot_path.as_ref()),
-    ] {
-        if let Some(path) = path
-            && !path.is_absolute()
-        {
-            return Err(ApiError::Validation {
-                field: Some(field.to_string()),
-                error: format!("{field} must be absolute"),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn create_vm_request_body(
-    config: &BootConfig,
-    reserved: &crate::pool::SlotStatus,
-) -> serde_json::Value {
-    let boot_mode = config.boot_mode.to_ascii_lowercase();
-    let payload = if boot_mode == "uefi" {
-        serde_json::json!({
-            "firmware": config.firmware_path,
-        })
-    } else {
-        serde_json::json!({
-            "kernel": config.kernel_path,
-            "initramfs": config.initrd_path,
-            "cmdline": config.cmdline,
-        })
-    };
-
-    let disks: Vec<serde_json::Value> = config
-        .disks
-        .iter()
-        .map(|path| match disk_image_type(path) {
-            Some(image_type) => serde_json::json!({
-                "path": path,
-                "image_type": image_type,
-            }),
-            None => serde_json::json!({"path": path}),
-        })
-        .collect();
-
-    serde_json::json!({
-        "cpus": {
-            "boot_vcpus": config.cpus,
-            "max_vcpus": config.cpus,
-        },
-        "memory": {
-            "size": config.memory_mb << 20,
-        },
-        "payload": payload,
-        "disks": disks,
-        "net": [{
-            "tap": reserved.tap,
-            "mac": reserved.mac,
-        }],
-        "rng": {
-            "src": "/dev/urandom",
-        }
-    })
-}
-
-fn create_restore_request_body(config: &BootConfig) -> serde_json::Value {
-    let source_url = config
-        .snapshot_path
-        .as_ref()
-        .map(|path| format!("file://{}", path.display()));
-
-    serde_json::json!({
-        "source_url": source_url,
-    })
-}
-
-fn disk_image_type(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    match extension.as_str() {
-        "qcow2" | "qcow" => Some("Qcow2"),
-        "raw" => Some("Raw"),
-        _ => None,
-    }
-}
-
-fn format_backend_error(response: &ProxyResponse) -> String {
-    if response.body.is_empty() {
-        return format!("backend returned status {}", response.status);
-    }
-
-    let body = String::from_utf8_lossy(&response.body);
-    let body = body.trim();
-    if body.is_empty() {
-        format!("backend returned status {}", response.status)
-    } else {
-        format!("backend returned status {}: {}", response.status, body)
-    }
 }
 
 fn boot_started_at() -> String {
@@ -417,7 +281,10 @@ impl TryFrom<&crate::pool::SlotStatus> for VmRuntime {
     }
 }
 
-async fn wait_for_slot_ready(pool: &SharedPool, slot: usize) -> Result<(), ApiError> {
+async fn wait_for_slot_ready<P: PoolFacade>(
+    pool: &Arc<RwLock<P>>,
+    slot: usize,
+) -> Result<(), ApiError> {
     let deadline = Duration::from_secs(5);
     let start = tokio::time::Instant::now();
 
@@ -444,7 +311,316 @@ async fn wait_for_slot_ready(pool: &SharedPool, slot: usize) -> Result<(), ApiEr
     }
 }
 
-async fn cleanup_reserved_vm(pool: &SharedPool, slot: usize) {
+async fn cleanup_reserved_vm<P: PoolFacade>(pool: &Arc<RwLock<P>>, slot: usize) {
     let pool = pool.read().await;
     let _ = pool.reset_slot(slot).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use axum::http::Method;
+    use tokio::sync::RwLock;
+
+    use super::{
+        delete_vm_with_pool, proxy_action_by_name_with_body_for_pool,
+        proxy_passthrough_by_name_for_pool,
+    };
+    use crate::error::ApiError;
+    use crate::pool::{PoolError, ProxyResponse, SlotState, SlotStatus, VmRuntime};
+    use crate::pool_facade::PoolFacade;
+
+    struct FakePool {
+        slot_by_name: Option<SlotStatus>,
+        passthrough_response: Option<ProxyResponse>,
+        scripted_request_responses: Mutex<VecDeque<ProxyResponse>>,
+        request_paths: Mutex<Vec<String>>,
+        released_slots: Mutex<Vec<usize>>,
+    }
+
+    impl FakePool {
+        fn occupied_status(name: &str, slot: usize) -> SlotStatus {
+            SlotStatus {
+                slot,
+                generation: 1,
+                state: SlotState::Occupied,
+                name: Some(name.to_string()),
+                mac: Some("02:aa:bb:cc:dd:ee".to_string()),
+                tap: Some(format!("tap{slot}")),
+                pid: Some(1234),
+                started_at: Some("2026-05-30T00:00:00Z".to_string()),
+                last_error: None,
+            }
+        }
+    }
+
+    impl PoolFacade for FakePool {
+        fn pool_size(&self) -> usize {
+            1
+        }
+
+        async fn pool_usage_counts(&self) -> Result<(usize, usize), PoolError> {
+            Ok((1, 0))
+        }
+
+        async fn list_runtimes(&self) -> Result<Vec<VmRuntime>, PoolError> {
+            Ok(Vec::new())
+        }
+
+        async fn find_runtime_by_name(&self, _name: &str) -> Result<Option<VmRuntime>, PoolError> {
+            Ok(None)
+        }
+
+        async fn allocate_slot(
+            &mut self,
+            _name: String,
+            _mac: String,
+        ) -> Result<SlotStatus, PoolError> {
+            Err(PoolError::Backend("unused in test".to_string()))
+        }
+
+        async fn find_slot_by_name(&self, name: &str) -> Result<Option<SlotStatus>, PoolError> {
+            Ok(self
+                .slot_by_name
+                .as_ref()
+                .filter(|status| status.name.as_deref() == Some(name))
+                .cloned())
+        }
+
+        async fn mark_slot_booted(
+            &self,
+            _slot: usize,
+            _started_at: String,
+        ) -> Result<SlotStatus, PoolError> {
+            Err(PoolError::Backend("unused in test".to_string()))
+        }
+
+        async fn release_slot(&self, slot: usize) -> Result<SlotStatus, PoolError> {
+            self.released_slots
+                .lock()
+                .expect("released_slots lock poisoned")
+                .push(slot);
+            Ok(SlotStatus {
+                slot,
+                generation: 2,
+                state: SlotState::Empty,
+                name: None,
+                mac: None,
+                tap: None,
+                pid: None,
+                started_at: None,
+                last_error: None,
+            })
+        }
+
+        async fn reset_slot(&self, _slot: usize) -> Result<SlotStatus, PoolError> {
+            Ok(SlotStatus {
+                slot: 0,
+                generation: 0,
+                state: SlotState::Empty,
+                name: None,
+                mac: None,
+                tap: None,
+                pid: None,
+                started_at: None,
+                last_error: None,
+            })
+        }
+
+        async fn get_slot_status(&self, _slot: usize) -> Result<SlotStatus, PoolError> {
+            Err(PoolError::Backend("unused in test".to_string()))
+        }
+
+        fn slot_socket_path(&self, _slot: usize) -> PathBuf {
+            PathBuf::from("/tmp/unused.sock")
+        }
+
+        async fn request(
+            &self,
+            _slot: usize,
+            _method: Method,
+            _path: &str,
+            _body: Vec<u8>,
+        ) -> Result<ProxyResponse, PoolError> {
+            self.passthrough_response
+                .clone()
+                .ok_or_else(|| PoolError::Backend("missing passthrough response".to_string()))
+        }
+
+        async fn request_with_content_type(
+            &self,
+            _slot: usize,
+            method: Method,
+            path: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<ProxyResponse, PoolError> {
+            self.request_paths
+                .lock()
+                .expect("request_paths lock poisoned")
+                .push(format!("{} {}", method, path));
+
+            self.scripted_request_responses
+                .lock()
+                .expect("scripted_request_responses lock poisoned")
+                .pop_front()
+                .ok_or_else(|| PoolError::Backend("missing scripted response".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_vm_returns_conflict_for_non_running_vm() {
+        let pool = FakePool {
+            slot_by_name: Some(SlotStatus {
+                state: SlotState::Booting,
+                ..FakePool::occupied_status("vm-a", 3)
+            }),
+            passthrough_response: None,
+            scripted_request_responses: Mutex::new(VecDeque::new()),
+            request_paths: Mutex::new(Vec::new()),
+            released_slots: Mutex::new(Vec::new()),
+        };
+
+        let shared = Arc::new(RwLock::new(pool));
+        let error = delete_vm_with_pool(&shared, "vm-a")
+            .await
+            .expect_err("expected conflict");
+
+        match error {
+            ApiError::Conflict(message) => assert!(message.contains("is not running")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_action_returns_not_found_for_unknown_vm() {
+        let pool = FakePool {
+            slot_by_name: None,
+            passthrough_response: None,
+            scripted_request_responses: Mutex::new(VecDeque::new()),
+            request_paths: Mutex::new(Vec::new()),
+            released_slots: Mutex::new(Vec::new()),
+        };
+
+        let shared = Arc::new(RwLock::new(pool));
+        let error = proxy_action_by_name_with_body_for_pool(
+            &shared,
+            "missing",
+            "/api/v1/vm.pause",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("expected not found");
+
+        match error {
+            ApiError::NotFound(message) => assert!(message.contains("not found")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_passthrough_returns_backend_response_for_running_vm() {
+        let pool = FakePool {
+            slot_by_name: Some(FakePool::occupied_status("vm-a", 5)),
+            passthrough_response: Some(ProxyResponse {
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                body: br#"{"ok":true}"#.to_vec(),
+            }),
+            scripted_request_responses: Mutex::new(VecDeque::new()),
+            request_paths: Mutex::new(Vec::new()),
+            released_slots: Mutex::new(Vec::new()),
+        };
+
+        let shared = Arc::new(RwLock::new(pool));
+        let response = proxy_passthrough_by_name_for_pool(&shared, "vm-a", "/api/v1/vm.info")
+            .await
+            .expect("expected passthrough response");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        assert_eq!(response.body, br#"{"ok":true}"#.to_vec());
+    }
+
+    #[tokio::test]
+    async fn delete_vm_success_calls_shutdown_then_delete_then_release() {
+        let pool = FakePool {
+            slot_by_name: Some(FakePool::occupied_status("vm-a", 7)),
+            passthrough_response: None,
+            scripted_request_responses: Mutex::new(VecDeque::from(vec![
+                ProxyResponse {
+                    status: 200,
+                    content_type: None,
+                    body: Vec::new(),
+                },
+                ProxyResponse {
+                    status: 200,
+                    content_type: None,
+                    body: Vec::new(),
+                },
+            ])),
+            request_paths: Mutex::new(Vec::new()),
+            released_slots: Mutex::new(Vec::new()),
+        };
+
+        let shared = Arc::new(RwLock::new(pool));
+        delete_vm_with_pool(&shared, "vm-a")
+            .await
+            .expect("expected delete success");
+
+        let guard = shared.read().await;
+        let paths = guard
+            .request_paths
+            .lock()
+            .expect("request_paths lock poisoned")
+            .clone();
+        let released = guard
+            .released_slots
+            .lock()
+            .expect("released_slots lock poisoned")
+            .clone();
+
+        assert_eq!(
+            paths,
+            vec!["PUT /api/v1/vm.shutdown", "PUT /api/v1/vm.delete"]
+        );
+        assert_eq!(released, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn proxy_action_returns_backend_error_on_unsuccessful_status() {
+        let pool = FakePool {
+            slot_by_name: Some(FakePool::occupied_status("vm-a", 2)),
+            passthrough_response: None,
+            scripted_request_responses: Mutex::new(VecDeque::from(vec![ProxyResponse {
+                status: 500,
+                content_type: Some("text/plain".to_string()),
+                body: b"boom".to_vec(),
+            }])),
+            request_paths: Mutex::new(Vec::new()),
+            released_slots: Mutex::new(Vec::new()),
+        };
+
+        let shared = Arc::new(RwLock::new(pool));
+        let error = proxy_action_by_name_with_body_for_pool(
+            &shared,
+            "vm-a",
+            "/api/v1/vm.pause",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("expected backend error");
+
+        match error {
+            ApiError::Backend(message) => {
+                assert!(message.contains("status 500"));
+                assert!(message.contains("boom"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

@@ -35,10 +35,6 @@ pub(crate) enum SlotCommand {
     ReleaseVm {
         response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
-    MarkVmFailed {
-        reason: String,
-        response: oneshot::Sender<Result<SlotStatus, PoolError>>,
-    },
     ResetVm {
         response: oneshot::Sender<Result<SlotStatus, PoolError>>,
     },
@@ -290,20 +286,6 @@ async fn handle_command(
                 })
             };
             let _ = response.send(result);
-        }
-        SlotCommand::MarkVmFailed { reason, response } => {
-            runtime.status.state = SlotState::Failed;
-            runtime.status.last_error = Some(reason);
-            runtime.status.pid = None;
-            runtime.status.started_at = None;
-
-            if let Some(child) = runtime.child.as_mut() {
-                stop_child(child).await;
-                runtime.child = None;
-            }
-            cleanup_api_socket(api_socket);
-
-            let _ = response.send(Ok(runtime.status.clone()));
         }
         SlotCommand::ResetVm { response } => {
             if let Some(child) = runtime.child.as_mut() {

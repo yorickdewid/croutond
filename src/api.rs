@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::error::ApiError;
 use crate::pool::{ProxyResponse, VmRuntime};
+use crate::pool_facade::PoolFacade;
 use crate::service::{self, BootConfig, SharedPool};
 
 #[derive(Clone)]
@@ -65,12 +66,12 @@ pub fn router(pool: SharedPool) -> Router {
 
 async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
     let pool = state.pool.read().await;
-    let (pool_in_use, pool_idle) = pool.pool_usage().await?;
+    let (pool_in_use, pool_idle) = pool.pool_usage_counts().await?;
 
     Ok(Json(HealthResponse {
         service: "croutond",
         version: env!("CARGO_PKG_VERSION"),
-        pool_size: pool.size(),
+        pool_size: pool.pool_size(),
         pool_in_use,
         pool_idle,
     }))
@@ -78,17 +79,17 @@ async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
 
 async fn list_vms(State(state): State<AppState>) -> ApiResult<ListResponse> {
     let pool = state.pool.read().await;
-    let vms = pool.list_running_vms().await?;
+    let vms = pool.list_runtimes().await?;
     Ok(Json(ListResponse { vms }))
 }
 
 async fn get_vm(Path(name): Path<String>, State(state): State<AppState>) -> ApiResult<VmRuntime> {
     let pool = state.pool.read().await;
-    if let Some(runtime) = pool.find_vm_runtime_by_name(&name).await? {
+    if let Some(runtime) = pool.find_runtime_by_name(&name).await? {
         return Ok(Json(runtime));
     }
 
-    if pool.find_vm_slot_status_by_name(&name).await?.is_some() {
+    if pool.find_slot_by_name(&name).await?.is_some() {
         return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
     }
 

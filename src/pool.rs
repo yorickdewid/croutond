@@ -41,9 +41,7 @@ pub struct VmRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmState {
-    Booting,
     Running,
-    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,7 +78,6 @@ pub enum PoolError {
         action: &'static str,
     },
     SlotNotFound(usize),
-    VmNotFound(String),
     VmAlreadyRunning(String),
     NoAvailableSlot,
     ChannelClosed,
@@ -94,7 +91,6 @@ impl fmt::Display for PoolError {
                 write!(f, "slot {slot} cannot perform {action} from state {from:?}")
             }
             Self::SlotNotFound(slot) => write!(f, "slot {slot} does not exist"),
-            Self::VmNotFound(name) => write!(f, "VM '{name}' not found"),
             Self::VmAlreadyRunning(name) => write!(f, "VM '{name}' is already running"),
             Self::NoAvailableSlot => write!(f, "pool is exhausted"),
             Self::ChannelClosed => write!(f, "slot worker channel is closed"),
@@ -371,26 +367,6 @@ impl ProcessPool {
         handle
             .tx
             .send(SlotCommand::ReleaseVm { response: tx })
-            .await
-            .map_err(|_| PoolError::ChannelClosed)?;
-
-        rx.await.map_err(|_| PoolError::ChannelClosed)?
-    }
-
-    pub async fn mark_vm_slot_failed(
-        &self,
-        slot: usize,
-        reason: String,
-    ) -> Result<SlotStatus, PoolError> {
-        let handle = self.slots.get(slot).ok_or(PoolError::SlotNotFound(slot))?;
-        let (tx, rx) = oneshot::channel();
-
-        handle
-            .tx
-            .send(SlotCommand::MarkVmFailed {
-                reason,
-                response: tx,
-            })
             .await
             .map_err(|_| PoolError::ChannelClosed)?;
 

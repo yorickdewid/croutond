@@ -5,6 +5,17 @@ use axum::http::Method;
 use crate::pool::{PoolError, ProcessPool, ProxyResponse, SlotStatus};
 
 pub(crate) trait PoolFacade {
+    fn pool_size(&self) -> usize;
+
+    async fn pool_usage_counts(&self) -> Result<(usize, usize), PoolError>;
+
+    async fn list_runtimes(&self) -> Result<Vec<crate::pool::VmRuntime>, PoolError>;
+
+    async fn find_runtime_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::pool::VmRuntime>, PoolError>;
+
     async fn allocate_slot(&mut self, name: String, mac: String) -> Result<SlotStatus, PoolError>;
 
     async fn find_slot_by_name(&self, name: &str) -> Result<Option<SlotStatus>, PoolError>;
@@ -42,6 +53,25 @@ pub(crate) trait PoolFacade {
 }
 
 impl PoolFacade for ProcessPool {
+    fn pool_size(&self) -> usize {
+        self.size()
+    }
+
+    async fn pool_usage_counts(&self) -> Result<(usize, usize), PoolError> {
+        self.pool_usage().await
+    }
+
+    async fn list_runtimes(&self) -> Result<Vec<crate::pool::VmRuntime>, PoolError> {
+        self.list_running_vms().await
+    }
+
+    async fn find_runtime_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::pool::VmRuntime>, PoolError> {
+        self.find_vm_runtime_by_name(name).await
+    }
+
     async fn allocate_slot(&mut self, name: String, mac: String) -> Result<SlotStatus, PoolError> {
         self.allocate_vm_slot(name, mac).await
     }
