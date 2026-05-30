@@ -10,6 +10,7 @@ use tokio::{
     sync::{oneshot, watch},
     time::Instant,
 };
+use tracing::debug;
 use tracing::{error, info, warn};
 
 use crate::ch_client::send_unix_http_request;
@@ -489,8 +490,9 @@ impl ProcessPool {
                     booting,
                     empty,
                     failed,
+                );
+                debug!(
                     slots = %format_slot_summary(&statuses),
-                    "pool occupancy snapshot"
                 );
             }
             Err(error) => {
