@@ -222,10 +222,13 @@ async fn main() -> io::Result<()> {
     let shared_pool = Arc::new(RwLock::new(pool));
     let autoscale_pool = shared_pool.clone();
     let autoscale_interval = Duration::from_millis(cli.autoscale_interval_ms);
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(autoscale_interval);
+
         loop {
             interval.tick().await;
+
             let mut pool = autoscale_pool.write().await;
             if let Err(error) = pool.autoscale_tick().await {
                 warn!(%error, "autoscale tick failed");
