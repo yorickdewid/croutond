@@ -178,6 +178,7 @@ impl ProcessPool {
         }
 
         info!(old_size = current_size, new_size, "pool scaled up");
+        self.log_pool_occupancy("extend").await;
     }
 
     pub async fn list_vm_slots(&self) -> Result<Vec<SlotStatus>, PoolError> {
@@ -275,7 +276,17 @@ impl ProcessPool {
             .await
             .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| PoolError::ChannelClosed)?
+        let status = rx.await.map_err(|_| PoolError::ChannelClosed)??;
+        info!(
+            slot = status.slot,
+            generation = status.generation,
+            state = ?status.state,
+            name = status.name.as_deref().unwrap_or("-"),
+            tap = status.tap.as_deref().unwrap_or("-"),
+            "slot reserved"
+        );
+        self.log_pool_occupancy("reserve_vm_slot").await;
+        Ok(status)
     }
 
     pub async fn allocate_vm_slot(
@@ -334,6 +345,7 @@ impl ProcessPool {
                 size = self.slots.len(),
                 "pool scaled down"
             );
+            self.log_pool_occupancy("autoscale_tick.scale_down").await;
             return Ok(true);
         }
 
@@ -357,7 +369,18 @@ impl ProcessPool {
             .await
             .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| PoolError::ChannelClosed)?
+        let status = rx.await.map_err(|_| PoolError::ChannelClosed)??;
+        info!(
+            slot = status.slot,
+            generation = status.generation,
+            state = ?status.state,
+            name = status.name.as_deref().unwrap_or("-"),
+            pid = status.pid.unwrap_or_default(),
+            started_at = status.started_at.as_deref().unwrap_or("-"),
+            "slot marked booted"
+        );
+        self.log_pool_occupancy("mark_vm_slot_booted").await;
+        Ok(status)
     }
 
     pub async fn release_vm_slot(&self, slot: usize) -> Result<SlotStatus, PoolError> {
@@ -370,7 +393,15 @@ impl ProcessPool {
             .await
             .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| PoolError::ChannelClosed)?
+        let status = rx.await.map_err(|_| PoolError::ChannelClosed)??;
+        info!(
+            slot = status.slot,
+            generation = status.generation,
+            state = ?status.state,
+            "slot released"
+        );
+        self.log_pool_occupancy("release_vm_slot").await;
+        Ok(status)
     }
 
     pub async fn reset_vm_slot(&self, slot: usize) -> Result<SlotStatus, PoolError> {
@@ -383,7 +414,15 @@ impl ProcessPool {
             .await
             .map_err(|_| PoolError::ChannelClosed)?;
 
-        rx.await.map_err(|_| PoolError::ChannelClosed)?
+        let status = rx.await.map_err(|_| PoolError::ChannelClosed)??;
+        info!(
+            slot = status.slot,
+            generation = status.generation,
+            state = ?status.state,
+            "slot reset"
+        );
+        self.log_pool_occupancy("reset_vm_slot").await;
+        Ok(status)
     }
 
     pub async fn proxy_vm_request(
@@ -422,6 +461,54 @@ impl ProcessPool {
             }
         }
     }
+
+    async fn log_pool_occupancy(&self, reason: &'static str) {
+        match self.list_vm_slots().await {
+            Ok(statuses) => {
+                let occupied = statuses
+                    .iter()
+                    .filter(|status| status.state == SlotState::Occupied)
+                    .count();
+                let booting = statuses
+                    .iter()
+                    .filter(|status| status.state == SlotState::Booting)
+                    .count();
+                let empty = statuses
+                    .iter()
+                    .filter(|status| status.state == SlotState::Empty)
+                    .count();
+                let failed = statuses
+                    .iter()
+                    .filter(|status| status.state == SlotState::Failed)
+                    .count();
+
+                info!(
+                    reason,
+                    size = statuses.len(),
+                    occupied,
+                    booting,
+                    empty,
+                    failed,
+                    slots = %format_slot_summary(&statuses),
+                    "pool occupancy snapshot"
+                );
+            }
+            Err(error) => {
+                warn!(reason, %error, "failed to collect pool occupancy snapshot");
+            }
+        }
+    }
+}
+
+fn format_slot_summary(statuses: &[SlotStatus]) -> String {
+    statuses
+        .iter()
+        .map(|status| {
+            let name = status.name.as_deref().unwrap_or("-");
+            format!("{}:{:?}({})", status.slot, status.state, name)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn runtime_from_slot_status(status: &SlotStatus) -> Option<VmRuntime> {
