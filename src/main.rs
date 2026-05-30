@@ -12,7 +12,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod api;
+mod ch_client;
 mod error;
+mod net_tap;
 mod pool;
 mod service;
 use pool::ProcessPool;

@@ -5,20 +5,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use axum::http::Method;
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{Request, body::Incoming, client::conn::http1, header};
-use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{
-    net::UnixStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::Instant,
 };
-use tokio_tun::TunBuilder;
 use tracing::{error, info, warn};
+
+use crate::ch_client::send_unix_http_request;
+use crate::net_tap::ensure_tap_device;
 
 pub struct ProcessPool {
     shutdown_tx: watch::Sender<bool>,
@@ -804,116 +801,4 @@ fn runtime_from_slot_status(status: &SlotStatus) -> Option<VmRuntime> {
         state: VmState::Running,
         started_at: status.started_at.clone()?,
     })
-}
-
-async fn send_unix_http_request(
-    socket_path: &Path,
-    method: Method,
-    path: &str,
-    body: Vec<u8>,
-    content_type: Option<&str>,
-) -> std::io::Result<ProxyResponse> {
-    let stream = UnixStream::connect(socket_path).await?;
-    let io = TokioIo::new(stream);
-
-    let (mut sender, connection) = http1::handshake(io).await.map_err(io_other)?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            warn!(%error, "hyper client connection error");
-        }
-    });
-
-    let uri = if path.is_empty() { "/" } else { path };
-    let mut request_builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::HOST, "localhost")
-        .header(header::CONNECTION, "close");
-
-    if let Some(value) = content_type {
-        request_builder = request_builder.header(header::CONTENT_TYPE, value);
-    }
-
-    let request = request_builder
-        .body(Full::new(Bytes::from(body)))
-        .map_err(io_invalid_input)?;
-
-    let response = sender.send_request(request).await.map_err(io_other)?;
-    response_to_proxy_response(response).await
-}
-
-async fn response_to_proxy_response(
-    response: hyper::Response<Incoming>,
-) -> io::Result<ProxyResponse> {
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
-
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(io_other)?
-        .to_bytes()
-        .to_vec();
-
-    Ok(ProxyResponse {
-        status,
-        content_type,
-        body,
-    })
-}
-
-fn io_other(error: impl fmt::Display) -> io::Error {
-    io::Error::other(error.to_string())
-}
-
-fn io_invalid_input(error: impl fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-}
-
-fn ensure_tap_device(name: &str, bridge: &str) -> Result<(), PoolError> {
-    match TunBuilder::new().name(name).tap().persist().up().build() {
-        Ok(_) => attach_tap_to_bridge(name, bridge),
-        Err(error) if is_tap_exists_error(&error) => attach_tap_to_bridge(name, bridge),
-        Err(error) => Err(PoolError::Backend(format!(
-            "failed to create tap interface '{name}': {error}"
-        ))),
-    }
-}
-
-fn attach_tap_to_bridge(name: &str, bridge: &str) -> Result<(), PoolError> {
-    let output = std::process::Command::new("ip")
-        .args(["link", "set", "dev", name, "master", bridge])
-        .output()
-        .map_err(|error| {
-            PoolError::Backend(format!(
-                "failed to attach tap interface '{name}' to bridge '{bridge}': {error}"
-            ))
-        })?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = if stderr.is_empty() {
-        format!("ip link exited with status {}", output.status)
-    } else {
-        stderr
-    };
-
-    Err(PoolError::Backend(format!(
-        "failed to attach tap interface '{name}' to bridge '{bridge}': {detail}"
-    )))
-}
-
-fn is_tap_exists_error(error: &tokio_tun::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("file exists")
-        || message.contains("already exists")
-        || message.contains("device or resource busy")
 }
