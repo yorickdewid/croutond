@@ -16,6 +16,7 @@ mod ch_client;
 mod error;
 mod net_tap;
 mod pool;
+mod pool_facade;
 mod service;
 mod slot_supervisor;
 use pool::ProcessPool;
