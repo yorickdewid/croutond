@@ -143,6 +143,71 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
     Ok(())
 }
 
+pub(crate) async fn proxy_action_by_name(
+    pool: &SharedPool,
+    name: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    proxy_action_by_name_with_body(pool, name, path, serde_json::json!({})).await
+}
+
+pub(crate) async fn proxy_action_by_name_with_body(
+    pool: &SharedPool,
+    name: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<(), ApiError> {
+    let pool_guard = pool.lock().await;
+    let status = pool_guard
+        .find_vm_slot_status_by_name(name)
+        .await
+        .map_err(map_pool_error)?
+        .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
+
+    if status.state != SlotState::Occupied {
+        return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
+    }
+
+    let response = pool_guard
+        .proxy_vm_request_with_content_type(
+            status.slot,
+            Method::PUT,
+            path,
+            serde_json::to_vec(&body).map_err(|error| ApiError::Backend(error.to_string()))?,
+            Some("application/json"),
+        )
+        .await
+        .map_err(map_pool_error)?;
+
+    if response.status >= 400 {
+        return Err(ApiError::Backend(format_backend_error(&response)));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn proxy_passthrough_by_name(
+    pool: &SharedPool,
+    name: &str,
+    path: &str,
+) -> Result<ProxyResponse, ApiError> {
+    let pool_guard = pool.lock().await;
+    let status = pool_guard
+        .find_vm_slot_status_by_name(name)
+        .await
+        .map_err(map_pool_error)?
+        .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
+
+    if status.state != SlotState::Occupied {
+        return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
+    }
+
+    pool_guard
+        .proxy_vm_request(status.slot, Method::GET, path, Vec::new())
+        .await
+        .map_err(map_pool_error)
+}
+
 fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
     if config.name.trim().is_empty() {
         return Err(ApiError::Validation {

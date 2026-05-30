@@ -5,14 +5,14 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{Method, Response, StatusCode, header},
+    http::{Response, StatusCode, header},
     response::IntoResponse,
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::pool::{PoolError, ProcessPool, SlotState, VmRuntime};
+use crate::pool::{PoolError, ProcessPool, ProxyResponse, VmRuntime};
 use crate::service;
 
 pub type SharedPool = Arc<Mutex<ProcessPool>>;
@@ -175,21 +175,24 @@ async fn reboot_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/api/v1/vm.reboot").await
+    service::proxy_action_by_name(&state.pool, &name, "/api/v1/vm.reboot").await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn pause_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/api/v1/vm.pause").await
+    service::proxy_action_by_name(&state.pool, &name, "/api/v1/vm.pause").await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn resume_vm(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name(&state, &name, "/api/v1/vm.resume").await
+    service::proxy_action_by_name(&state.pool, &name, "/api/v1/vm.resume").await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn snapshot_vm(
@@ -205,21 +208,27 @@ async fn snapshot_vm(
     }
 
     let body = serde_json::json!({"destPath": payload.dest_path});
-    proxy_action_by_name_with_body(&state, &name, "/api/v1/vm.snapshot", body).await
+    service::proxy_action_by_name_with_body(&state.pool, &name, "/api/v1/vm.snapshot", body)
+        .await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn proxy_info(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ApiError> {
-    proxy_passthrough_by_name(&state, &name, "/api/v1/vm.info").await
+    let response =
+        service::proxy_passthrough_by_name(&state.pool, &name, "/api/v1/vm.info").await?;
+    build_proxy_response(response)
 }
 
 async fn proxy_counters(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ApiError> {
-    proxy_passthrough_by_name(&state, &name, "/api/v1/vm.counters").await
+    let response =
+        service::proxy_passthrough_by_name(&state.pool, &name, "/api/v1/vm.counters").await?;
+    build_proxy_response(response)
 }
 
 pub(crate) fn map_pool_error(error: PoolError) -> ApiError {
@@ -238,73 +247,7 @@ pub(crate) fn map_pool_error(error: PoolError) -> ApiError {
     }
 }
 
-async fn proxy_action_by_name(
-    state: &AppState,
-    name: &str,
-    path: &str,
-) -> Result<Json<OkResponse>, ApiError> {
-    proxy_action_by_name_with_body(state, name, path, serde_json::json!({})).await
-}
-
-async fn proxy_action_by_name_with_body(
-    state: &AppState,
-    name: &str,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<Json<OkResponse>, ApiError> {
-    let pool = state.pool.lock().await;
-    let status = pool
-        .find_vm_slot_status_by_name(name)
-        .await
-        .map_err(map_pool_error)?
-        .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
-
-    if status.state != SlotState::Occupied {
-        return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
-    }
-
-    let response = pool
-        .proxy_vm_request_with_content_type(
-            status.slot,
-            Method::PUT,
-            path,
-            serde_json::to_vec(&body).map_err(|error| ApiError::Backend(error.to_string()))?,
-            Some("application/json"),
-        )
-        .await
-        .map_err(map_pool_error)?;
-
-    if response.status >= 400 {
-        return Err(ApiError::Backend(format!(
-            "backend returned status {}",
-            response.status
-        )));
-    }
-
-    Ok(Json(OkResponse { ok: true }))
-}
-
-async fn proxy_passthrough_by_name(
-    state: &AppState,
-    name: &str,
-    path: &str,
-) -> Result<Response<Body>, ApiError> {
-    let pool = state.pool.lock().await;
-    let status = pool
-        .find_vm_slot_status_by_name(name)
-        .await
-        .map_err(map_pool_error)?
-        .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
-
-    if status.state != SlotState::Occupied {
-        return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
-    }
-
-    let response = pool
-        .proxy_vm_request(status.slot, Method::GET, path, Vec::new())
-        .await
-        .map_err(map_pool_error)?;
-
+fn build_proxy_response(response: ProxyResponse) -> Result<Response<Body>, ApiError> {
     let mut builder = Response::builder().status(response.status);
     if let Some(content_type) = response.content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
