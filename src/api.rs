@@ -1,21 +1,16 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{Response, StatusCode, header},
-    response::IntoResponse,
+    http::{Response, header},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use std::path::PathBuf;
 
-use crate::pool::{PoolError, ProcessPool, ProxyResponse, VmRuntime};
-use crate::service;
-
-pub type SharedPool = Arc<Mutex<ProcessPool>>;
+use crate::error::ApiError;
+use crate::pool::{ProxyResponse, VmRuntime};
+use crate::service::{self, BootConfig, SharedPool};
 
 #[derive(Clone)]
 struct AppState {
@@ -32,28 +27,6 @@ struct HealthResponse {
     pool_in_use: usize,
     #[serde(rename = "poolIdle")]
     pool_idle: usize,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    field: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BootConfig {
-    pub(crate) name: String,
-    pub(crate) cpus: u16,
-    pub(crate) memory_mb: u64,
-    pub(crate) boot_mode: String,
-    pub(crate) disks: Vec<PathBuf>,
-    pub(crate) kernel_path: Option<PathBuf>,
-    pub(crate) initrd_path: Option<PathBuf>,
-    pub(crate) cmdline: Option<String>,
-    pub(crate) firmware_path: Option<PathBuf>,
-    pub(crate) snapshot_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -74,32 +47,6 @@ struct ListResponse {
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
-#[derive(Debug)]
-pub(crate) enum ApiError {
-    Validation {
-        field: Option<String>,
-        error: String,
-    },
-    NotFound(String),
-    Conflict(String),
-    PoolExhausted(String),
-    Backend(String),
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> axum::response::Response {
-        let (status, field, error) = match self {
-            Self::Validation { field, error } => (StatusCode::BAD_REQUEST, field, error),
-            Self::NotFound(error) => (StatusCode::NOT_FOUND, None, error),
-            Self::Conflict(error) => (StatusCode::CONFLICT, None, error),
-            Self::PoolExhausted(error) => (StatusCode::SERVICE_UNAVAILABLE, None, error),
-            Self::Backend(error) => (StatusCode::INTERNAL_SERVER_ERROR, None, error),
-        };
-
-        (status, Json(ErrorResponse { error, field })).into_response()
-    }
-}
-
 pub fn router(pool: SharedPool) -> Router {
     let state = AppState { pool };
 
@@ -117,39 +64,31 @@ pub fn router(pool: SharedPool) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
-    let pool = state.pool.lock().await;
+    let pool = state.pool.read().await;
+    let (pool_in_use, pool_idle) = pool.pool_usage().await?;
 
     Ok(Json(HealthResponse {
         service: "croutond",
         version: env!("CARGO_PKG_VERSION"),
         pool_size: pool.size(),
-        pool_in_use: pool.pool_in_use().await.map_err(map_pool_error)?,
-        pool_idle: pool.pool_idle().await.map_err(map_pool_error)?,
+        pool_in_use,
+        pool_idle,
     }))
 }
 
 async fn list_vms(State(state): State<AppState>) -> ApiResult<ListResponse> {
-    let pool = state.pool.lock().await;
-    let vms = pool.list_running_vms().await.map_err(map_pool_error)?;
+    let pool = state.pool.read().await;
+    let vms = pool.list_running_vms().await?;
     Ok(Json(ListResponse { vms }))
 }
 
 async fn get_vm(Path(name): Path<String>, State(state): State<AppState>) -> ApiResult<VmRuntime> {
-    let pool = state.pool.lock().await;
-    if let Some(runtime) = pool
-        .find_vm_runtime_by_name(&name)
-        .await
-        .map_err(map_pool_error)?
-    {
+    let pool = state.pool.read().await;
+    if let Some(runtime) = pool.find_vm_runtime_by_name(&name).await? {
         return Ok(Json(runtime));
     }
 
-    if pool
-        .find_vm_slot_status_by_name(&name)
-        .await
-        .map_err(map_pool_error)?
-        .is_some()
-    {
+    if pool.find_vm_slot_status_by_name(&name).await?.is_some() {
         return Err(ApiError::Conflict(format!("VM '{name}' is not running")));
     }
 
@@ -229,22 +168,6 @@ async fn proxy_counters(
     let response =
         service::proxy_passthrough_by_name(&state.pool, &name, "/api/v1/vm.counters").await?;
     build_proxy_response(response)
-}
-
-pub(crate) fn map_pool_error(error: PoolError) -> ApiError {
-    match error {
-        PoolError::SlotNotFound(slot) => ApiError::NotFound(format!("slot {slot} does not exist")),
-        PoolError::VmNotFound(name) => ApiError::NotFound(format!("VM '{name}' not found")),
-        PoolError::VmAlreadyRunning(name) => {
-            ApiError::Conflict(format!("VM '{name}' is already running"))
-        }
-        PoolError::NoAvailableSlot => ApiError::PoolExhausted("pool exhausted".to_string()),
-        PoolError::InvalidTransition { slot, from, action } => ApiError::Conflict(format!(
-            "slot {slot} cannot perform {action} from state {from:?}"
-        )),
-        PoolError::ChannelClosed => ApiError::Backend("slot worker channel is closed".to_string()),
-        PoolError::Backend(error) => ApiError::Backend(error),
-    }
 }
 
 fn build_proxy_response(response: ProxyResponse) -> Result<Response<Body>, ApiError> {

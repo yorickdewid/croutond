@@ -1,12 +1,32 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::Method;
+use serde::Deserialize;
 use tokio::net::UnixStream;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 
-use crate::api::{ApiError, BootConfig, SharedPool, map_pool_error};
+use crate::error::ApiError;
 use crate::pool::{PoolError, ProxyResponse, SlotState, VmRuntime, VmState};
+
+pub(crate) type SharedPool = Arc<RwLock<crate::pool::ProcessPool>>;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BootConfig {
+    pub(crate) name: String,
+    pub(crate) cpus: u16,
+    pub(crate) memory_mb: u64,
+    pub(crate) boot_mode: String,
+    pub(crate) disks: Vec<PathBuf>,
+    pub(crate) kernel_path: Option<PathBuf>,
+    pub(crate) initrd_path: Option<PathBuf>,
+    pub(crate) cmdline: Option<String>,
+    pub(crate) firmware_path: Option<PathBuf>,
+    pub(crate) snapshot_path: Option<PathBuf>,
+}
 
 pub(crate) async fn create_vm(
     pool: &SharedPool,
@@ -18,10 +38,8 @@ pub(crate) async fn create_vm(
     let mac = mac_for_name(&name);
 
     let reserved = {
-        let mut pool = pool.lock().await;
-        pool.allocate_vm_slot(name.clone(), mac)
-            .await
-            .map_err(map_pool_error)?
+        let mut pool = pool.write().await;
+        pool.allocate_vm_slot(name.clone(), mac).await?
     };
 
     let slot = reserved.slot;
@@ -36,7 +54,7 @@ pub(crate) async fn create_vm(
             .map_err(|error| ApiError::Backend(error.to_string()))?
     };
 
-    let pool_guard = pool.lock().await;
+    let pool_guard = pool.read().await;
     let create_path = if payload.snapshot_path.is_some() {
         "/api/v1/vm.restore"
     } else {
@@ -51,8 +69,7 @@ pub(crate) async fn create_vm(
             proxy_body,
             Some("application/json"),
         )
-        .await
-        .map_err(map_pool_error)?;
+        .await?;
 
     if create_response.status >= 400 {
         drop(pool_guard);
@@ -69,8 +86,7 @@ pub(crate) async fn create_vm(
                 Vec::new(),
                 None,
             )
-            .await
-            .map_err(map_pool_error)?;
+            .await?;
 
         if boot_response.status >= 400 {
             drop(pool_guard);
@@ -81,22 +97,20 @@ pub(crate) async fn create_vm(
 
     drop(pool_guard);
     wait_for_slot_ready(pool, slot).await?;
-    let pool_guard = pool.lock().await;
+    let pool_guard = pool.read().await;
 
     let status = pool_guard
         .mark_vm_slot_booted(slot, boot_started_at)
-        .await
-        .map_err(map_pool_error)?;
+        .await?;
 
-    (&status).try_into().map_err(map_pool_error)
+    (&status).try_into().map_err(ApiError::from)
 }
 
 pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiError> {
-    let pool_guard = pool.lock().await;
+    let pool_guard = pool.read().await;
     let status = pool_guard
         .find_vm_slot_status_by_name(name)
-        .await
-        .map_err(map_pool_error)?
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
 
     if status.state != SlotState::Occupied {
@@ -112,8 +126,7 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
             Vec::new(),
             None,
         )
-        .await
-        .map_err(map_pool_error)?;
+        .await?;
     if shutdown.status >= 400 {
         drop(pool_guard);
         cleanup_reserved_vm(pool, slot).await;
@@ -128,18 +141,14 @@ pub(crate) async fn delete_vm(pool: &SharedPool, name: &str) -> Result<(), ApiEr
             Vec::new(),
             None,
         )
-        .await
-        .map_err(map_pool_error)?;
+        .await?;
     if delete.status >= 400 {
         drop(pool_guard);
         cleanup_reserved_vm(pool, slot).await;
         return Err(ApiError::Backend(format_backend_error(&delete)));
     }
 
-    let _ = pool_guard
-        .release_vm_slot(slot)
-        .await
-        .map_err(map_pool_error)?;
+    let _ = pool_guard.release_vm_slot(slot).await?;
     Ok(())
 }
 
@@ -157,11 +166,10 @@ pub(crate) async fn proxy_action_by_name_with_body(
     path: &str,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
-    let pool_guard = pool.lock().await;
+    let pool_guard = pool.read().await;
     let status = pool_guard
         .find_vm_slot_status_by_name(name)
-        .await
-        .map_err(map_pool_error)?
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
 
     if status.state != SlotState::Occupied {
@@ -176,8 +184,7 @@ pub(crate) async fn proxy_action_by_name_with_body(
             serde_json::to_vec(&body).map_err(|error| ApiError::Backend(error.to_string()))?,
             Some("application/json"),
         )
-        .await
-        .map_err(map_pool_error)?;
+        .await?;
 
     if response.status >= 400 {
         return Err(ApiError::Backend(format_backend_error(&response)));
@@ -191,11 +198,10 @@ pub(crate) async fn proxy_passthrough_by_name(
     name: &str,
     path: &str,
 ) -> Result<ProxyResponse, ApiError> {
-    let pool_guard = pool.lock().await;
+    let pool_guard = pool.read().await;
     let status = pool_guard
         .find_vm_slot_status_by_name(name)
-        .await
-        .map_err(map_pool_error)?
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?;
 
     if status.state != SlotState::Occupied {
@@ -205,7 +211,7 @@ pub(crate) async fn proxy_passthrough_by_name(
     pool_guard
         .proxy_vm_request(status.slot, Method::GET, path, Vec::new())
         .await
-        .map_err(map_pool_error)
+        .map_err(ApiError::from)
 }
 
 fn validate_boot_config(config: &BootConfig) -> Result<(), ApiError> {
@@ -435,11 +441,8 @@ async fn wait_for_slot_ready(pool: &SharedPool, slot: usize) -> Result<(), ApiEr
     let start = tokio::time::Instant::now();
 
     loop {
-        let pool = pool.lock().await;
-        let status = pool
-            .get_vm_slot_status(slot)
-            .await
-            .map_err(map_pool_error)?;
+        let pool = pool.read().await;
+        let status = pool.get_vm_slot_status(slot).await?;
         let socket_path = pool.vm_socket_path(slot);
         let has_pid = status.pid.is_some();
 
@@ -461,6 +464,6 @@ async fn wait_for_slot_ready(pool: &SharedPool, slot: usize) -> Result<(), ApiEr
 }
 
 async fn cleanup_reserved_vm(pool: &SharedPool, slot: usize) {
-    let pool = pool.lock().await;
+    let pool = pool.read().await;
     let _ = pool.reset_vm_slot(slot).await;
 }

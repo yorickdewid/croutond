@@ -272,22 +272,13 @@ impl ProcessPool {
         rx.await.map_err(|_| PoolError::ChannelClosed)
     }
 
-    pub async fn pool_idle(&self) -> Result<usize, PoolError> {
-        Ok(self
-            .list_vm_slots()
-            .await?
-            .into_iter()
+    pub async fn pool_usage(&self) -> Result<(usize, usize), PoolError> {
+        let statuses = self.list_vm_slots().await?;
+        let idle = statuses
+            .iter()
             .filter(|status| status.state == SlotState::Empty)
-            .count())
-    }
-
-    pub async fn pool_in_use(&self) -> Result<usize, PoolError> {
-        Ok(self
-            .list_vm_slots()
-            .await?
-            .into_iter()
-            .filter(|status| status.state != SlotState::Empty)
-            .count())
+            .count();
+        Ok((statuses.len() - idle, idle))
     }
 
     pub fn size(&self) -> usize {
