@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use axum::http::Method;
 use bytes::Bytes;
@@ -14,6 +15,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_tun::TunBuilder;
 use tracing::{error, info, warn};
@@ -22,6 +24,12 @@ pub struct ProcessPool {
     shutdown_tx: watch::Sender<bool>,
     slots: Vec<SlotHandle>,
     vm_path: PathBuf,
+    program: String,
+    args: Vec<OsString>,
+    min_pool_size: usize,
+    max_pool_size: usize,
+    scale_down_cooldown: Duration,
+    last_scale_down_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,15 +181,26 @@ impl ProcessPool {
     /// receives the supplied program arguments plus the slot-specific socket
     /// path.
     pub async fn spawn(
-        pool_size: usize,
+        min_pool_size: usize,
+        max_pool_size: usize,
+        scale_down_cooldown: Duration,
         program: &str,
         args: &[OsString],
         vm_path: &Path,
     ) -> std::io::Result<Self> {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut slots = Vec::with_capacity(pool_size);
+        if max_pool_size < min_pool_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "max_pool_size ({max_pool_size}) must be >= min_pool_size ({min_pool_size})"
+                ),
+            ));
+        }
 
-        for slot in 0..pool_size {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut slots = Vec::with_capacity(min_pool_size);
+
+        for slot in 0..min_pool_size {
             let shutdown_rx = shutdown_rx.clone();
             slots.push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
         }
@@ -190,25 +209,31 @@ impl ProcessPool {
             shutdown_tx,
             slots,
             vm_path: vm_path.to_path_buf(),
+            program: program.to_string(),
+            args: args.to_vec(),
+            min_pool_size,
+            max_pool_size,
+            scale_down_cooldown,
+            last_scale_down_at: None,
         })
     }
 
-    #[allow(dead_code)]
-    pub async fn extend(
-        &mut self,
-        additional_size: usize,
-        program: &str,
-        args: &[OsString],
-        vm_path: &Path,
-    ) {
+    pub async fn extend(&mut self, additional_size: usize) {
         let current_size = self.slots.len();
         let new_size = current_size + additional_size;
 
         for slot in current_size..new_size {
             let shutdown_rx = self.shutdown_tx.subscribe();
-            self.slots
-                .push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
+            self.slots.push(initialize_slot(
+                slot,
+                &self.program,
+                &self.args,
+                &self.vm_path,
+                shutdown_rx,
+            ));
         }
+
+        info!(old_size = current_size, new_size, "pool scaled up");
     }
 
     pub async fn list_vm_slots(&self) -> Result<Vec<SlotStatus>, PoolError> {
@@ -319,7 +344,7 @@ impl ProcessPool {
     }
 
     pub async fn allocate_vm_slot(
-        &self,
+        &mut self,
         name: String,
         mac: String,
     ) -> Result<SlotStatus, PoolError> {
@@ -327,16 +352,57 @@ impl ProcessPool {
             return Err(PoolError::VmAlreadyRunning(name));
         }
 
-        let slot = self
-            .list_vm_slots()
-            .await?
-            .into_iter()
-            .find(|status| status.state == SlotState::Empty)
-            .map(|status| status.slot)
-            .ok_or(PoolError::NoAvailableSlot)?;
+        loop {
+            if let Some(slot) = self
+                .list_vm_slots()
+                .await?
+                .into_iter()
+                .find(|status| status.state == SlotState::Empty)
+                .map(|status| status.slot)
+            {
+                let tap = format!("tap{slot}");
+                return self.reserve_vm_slot(slot, name, mac, tap).await;
+            }
 
-        let tap = format!("tap{slot}");
-        self.reserve_vm_slot(slot, name, mac, tap).await
+            if self.slots.len() >= self.max_pool_size {
+                return Err(PoolError::NoAvailableSlot);
+            }
+
+            self.extend(1).await;
+        }
+    }
+
+    pub async fn autoscale_tick(&mut self) -> Result<bool, PoolError> {
+        if self.slots.len() <= self.min_pool_size {
+            return Ok(false);
+        }
+
+        if let Some(last_scale_down_at) = self.last_scale_down_at
+            && last_scale_down_at.elapsed() < self.scale_down_cooldown
+        {
+            return Ok(false);
+        }
+
+        let shrink_slot = self.slots.len() - 1;
+        let status = self.get_vm_slot_status(shrink_slot).await?;
+        if status.state != SlotState::Empty {
+            return Ok(false);
+        }
+
+        if let Some(slot) = self.slots.pop() {
+            if let Err(error) = slot.worker.await {
+                error!(%error, "worker task failed during scale down");
+            }
+            self.last_scale_down_at = Some(Instant::now());
+            info!(
+                slot = shrink_slot,
+                size = self.slots.len(),
+                "pool scaled down"
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     pub async fn mark_vm_slot_booted(

@@ -3,11 +3,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod api;
@@ -28,9 +29,32 @@ struct Cli {
         long,
         value_parser = parse_pool_size,
         default_value_t = 4,
-        help = "Number of VM slots"
+        help = "Minimum number of warm VM slots"
     )]
     pool_size: usize,
+
+    #[arg(
+        long,
+        value_parser = parse_pool_size,
+        help = "Maximum number of VM slots (defaults to --pool-size when omitted)"
+    )]
+    max_pool_size: Option<usize>,
+
+    #[arg(
+        long,
+        value_parser = parse_cooldown_secs,
+        default_value_t = 15,
+        help = "Cooldown in seconds between pool scale-down operations"
+    )]
+    scale_down_cooldown_secs: u64,
+
+    #[arg(
+        long,
+        value_parser = parse_interval_ms,
+        default_value_t = 1_000,
+        help = "Autoscale background tick interval in milliseconds"
+    )]
+    autoscale_interval_ms: u64,
 
     #[arg(long, default_value = "/tmp", help = "Path to the VM data directory")]
     runtime_dir: PathBuf,
@@ -69,6 +93,30 @@ fn parse_pool_size(value: &str) -> Result<usize, String> {
 
     if parsed == 0 {
         return Err("pool size must be at least 1".to_string());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_cooldown_secs(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid cooldown seconds: {value}"))?;
+
+    if parsed == 0 {
+        return Err("scale-down cooldown must be at least 1 second".to_string());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_interval_ms(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid autoscale interval milliseconds: {value}"))?;
+
+    if parsed == 0 {
+        return Err("autoscale interval must be at least 1 millisecond".to_string());
     }
 
     Ok(parsed)
@@ -124,14 +172,52 @@ async fn main() -> io::Result<()> {
     init_logging();
 
     let cli = Cli::parse();
+    let max_pool_size = cli.max_pool_size.unwrap_or(cli.pool_size);
+    if max_pool_size < cli.pool_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--max-pool-size ({max_pool_size}) must be >= --pool-size ({})",
+                cli.pool_size
+            ),
+        ));
+    }
+
     let (program, args) = resolve_program_and_args(cli.ch_bin).map_err(io::Error::other)?;
     std::fs::create_dir_all(&cli.runtime_dir)?;
 
-    let pool = ProcessPool::spawn(cli.pool_size, &program, &args, &cli.runtime_dir).await?;
+    let pool = ProcessPool::spawn(
+        cli.pool_size,
+        max_pool_size,
+        Duration::from_secs(cli.scale_down_cooldown_secs),
+        &program,
+        &args,
+        &cli.runtime_dir,
+    )
+    .await?;
 
-    info!(slots = pool.size(), "orchestrator pool is running");
+    info!(
+        min_slots = cli.pool_size,
+        max_slots = max_pool_size,
+        autoscale_interval_ms = cli.autoscale_interval_ms,
+        slots = pool.size(),
+        "orchestrator pool is running"
+    );
 
     let shared_pool = Arc::new(Mutex::new(pool));
+    let autoscale_pool = shared_pool.clone();
+    let autoscale_interval = Duration::from_millis(cli.autoscale_interval_ms);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(autoscale_interval);
+        loop {
+            interval.tick().await;
+            let mut pool = autoscale_pool.lock().await;
+            if let Err(error) = pool.autoscale_tick().await {
+                warn!(%error, "autoscale tick failed");
+            }
+        }
+    });
+
     let app = api::router(shared_pool.clone());
     let listener = bind_listener(cli.listen_addr).await?;
 

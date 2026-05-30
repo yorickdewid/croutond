@@ -18,7 +18,7 @@ pub(crate) async fn create_vm(
     let mac = mac_for_name(&name);
 
     let reserved = {
-        let pool = pool.lock().await;
+        let mut pool = pool.lock().await;
         pool.allocate_vm_slot(name.clone(), mac)
             .await
             .map_err(map_pool_error)?
