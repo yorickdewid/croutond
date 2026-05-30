@@ -26,6 +26,7 @@ pub struct ProcessPool {
     vm_path: PathBuf,
     program: String,
     args: Vec<OsString>,
+    bridge: String,
     min_pool_size: usize,
     max_pool_size: usize,
     scale_down_cooldown: Duration,
@@ -156,19 +157,21 @@ fn initialize_slot(
     slot: usize,
     program: &str,
     args: &[OsString],
+    bridge: &str,
     vm_path: &Path,
     shutdown_rx: watch::Receiver<bool>,
 ) -> SlotHandle {
     let (tx, rx) = mpsc::channel(16);
 
     let program = program.to_owned();
+    let bridge = bridge.to_owned();
     let mut args = args.to_vec();
     let api_socket = vm_path.join(format!("vmm{slot}.sock"));
     args.push("--api-socket".into());
     args.push(api_socket.clone().into_os_string());
 
     let worker = tokio::spawn(async move {
-        supervise_slot(slot, program, args, api_socket, shutdown_rx, rx).await;
+        supervise_slot(slot, program, args, bridge, api_socket, shutdown_rx, rx).await;
     });
 
     SlotHandle { tx, worker }
@@ -186,6 +189,7 @@ impl ProcessPool {
         scale_down_cooldown: Duration,
         program: &str,
         args: &[OsString],
+        bridge: &str,
         vm_path: &Path,
     ) -> std::io::Result<Self> {
         if max_pool_size < min_pool_size {
@@ -202,7 +206,14 @@ impl ProcessPool {
 
         for slot in 0..min_pool_size {
             let shutdown_rx = shutdown_rx.clone();
-            slots.push(initialize_slot(slot, program, args, vm_path, shutdown_rx));
+            slots.push(initialize_slot(
+                slot,
+                program,
+                args,
+                bridge,
+                vm_path,
+                shutdown_rx,
+            ));
         }
 
         Ok(Self {
@@ -211,6 +222,7 @@ impl ProcessPool {
             vm_path: vm_path.to_path_buf(),
             program: program.to_string(),
             args: args.to_vec(),
+            bridge: bridge.to_string(),
             min_pool_size,
             max_pool_size,
             scale_down_cooldown,
@@ -228,6 +240,7 @@ impl ProcessPool {
                 slot,
                 &self.program,
                 &self.args,
+                &self.bridge,
                 &self.vm_path,
                 shutdown_rx,
             ));
@@ -513,6 +526,7 @@ async fn supervise_slot(
     slot: usize,
     program: String,
     args: Vec<OsString>,
+    bridge: String,
     api_socket: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
     mut commands: mpsc::Receiver<SlotCommand>,
@@ -573,7 +587,7 @@ async fn supervise_slot(
         }
 
         while let Ok(command) = commands.try_recv() {
-            handle_command(command, &mut runtime, &api_socket).await;
+            handle_command(command, &mut runtime, &bridge, &api_socket).await;
         }
 
         if let Some(child) = runtime.child.as_mut() {
@@ -624,7 +638,7 @@ async fn supervise_slot(
             }
             maybe_command = commands.recv() => {
                 if let Some(command) = maybe_command {
-                    handle_command(command, &mut runtime, &api_socket).await;
+                    handle_command(command, &mut runtime, &bridge, &api_socket).await;
                 } else {
                     if let Some(child) = runtime.child.as_mut() {
                         stop_child(child).await;
@@ -645,7 +659,12 @@ fn should_spawn(state: SlotState) -> bool {
     )
 }
 
-async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_socket: &Path) {
+async fn handle_command(
+    command: SlotCommand,
+    runtime: &mut SlotRuntime,
+    bridge: &str,
+    api_socket: &Path,
+) {
     match command {
         SlotCommand::GetVmStatus { response } => {
             let _ = response.send(runtime.status.clone());
@@ -657,7 +676,7 @@ async fn handle_command(command: SlotCommand, runtime: &mut SlotRuntime, api_soc
             response,
         } => {
             let result = if runtime.status.state == SlotState::Empty {
-                match ensure_tap_device(&tap) {
+                match ensure_tap_device(&tap, bridge) {
                     Ok(()) => {
                         runtime.status.state = SlotState::Booting;
                         runtime.status.name = Some(name);
@@ -865,14 +884,40 @@ fn io_invalid_input(error: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 
-fn ensure_tap_device(name: &str) -> Result<(), PoolError> {
+fn ensure_tap_device(name: &str, bridge: &str) -> Result<(), PoolError> {
     match TunBuilder::new().name(name).tap().persist().up().build() {
-        Ok(_) => Ok(()),
-        Err(error) if is_tap_exists_error(&error) => Ok(()),
+        Ok(_) => attach_tap_to_bridge(name, bridge),
+        Err(error) if is_tap_exists_error(&error) => attach_tap_to_bridge(name, bridge),
         Err(error) => Err(PoolError::Backend(format!(
             "failed to create tap interface '{name}': {error}"
         ))),
     }
+}
+
+fn attach_tap_to_bridge(name: &str, bridge: &str) -> Result<(), PoolError> {
+    let output = std::process::Command::new("ip")
+        .args(["link", "set", "dev", name, "master", bridge])
+        .output()
+        .map_err(|error| {
+            PoolError::Backend(format!(
+                "failed to attach tap interface '{name}' to bridge '{bridge}': {error}"
+            ))
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("ip link exited with status {}", output.status)
+    } else {
+        stderr
+    };
+
+    Err(PoolError::Backend(format!(
+        "failed to attach tap interface '{name}' to bridge '{bridge}': {detail}"
+    )))
 }
 
 fn is_tap_exists_error(error: &tokio_tun::Error) -> bool {

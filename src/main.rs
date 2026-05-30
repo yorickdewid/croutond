@@ -62,6 +62,9 @@ struct Cli {
     #[arg(long, help = "Cloud Hypervisor binary path")]
     ch_bin: String,
 
+    #[arg(long, help = "Bridge interface used for VM TAP devices")]
+    bridge: String,
+
     #[arg(long, default_value = "[::]:7777", help = "REST listen address")]
     listen_addr: SocketAddr,
 }
@@ -192,11 +195,13 @@ async fn main() -> io::Result<()> {
         Duration::from_secs(cli.scale_down_cooldown_secs),
         &program,
         &args,
+        &cli.bridge,
         &cli.runtime_dir,
     )
     .await?;
 
     info!(
+        bridge = %cli.bridge,
         min_slots = cli.pool_size,
         max_slots = max_pool_size,
         autoscale_interval_ms = cli.autoscale_interval_ms,

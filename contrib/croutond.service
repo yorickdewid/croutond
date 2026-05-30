@@ -10,8 +10,10 @@ Group=croutond
 EnvironmentFile=-/etc/default/croutond
 Environment=CLOUD_HYPERVISOR=/usr/bin/cloud-hypervisor
 Environment=CROUTOND_RUNTIME_DIR=/var/lib/croutond
-Environment=CROUTOND_POOL_SIZE=4
-ExecStart=/usr/local/bin/croutond --ch-bin "${CLOUD_HYPERVISOR}" --runtime-dir "${CROUTOND_RUNTIME_DIR}" --pool-size "${CROUTOND_POOL_SIZE}"
+Environment=CROUTOND_BRIDGE=br0
+Environment=CROUTOND_POOL_SIZE=2
+Environment=CROUTOND_MAX_POOL_SIZE=4
+ExecStart=/usr/local/bin/croutond --ch-bin "${CLOUD_HYPERVISOR}" --runtime-dir "${CROUTOND_RUNTIME_DIR}" --bridge "${CROUTOND_BRIDGE}" --pool-size "${CROUTOND_POOL_SIZE}" --max-pool-size "${CROUTOND_MAX_POOL_SIZE}" \
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
