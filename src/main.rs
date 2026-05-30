@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod api;
+mod error;
 mod pool;
 mod service;
 use pool::ProcessPool;
@@ -209,14 +210,14 @@ async fn main() -> io::Result<()> {
         "orchestrator pool is running"
     );
 
-    let shared_pool = Arc::new(Mutex::new(pool));
+    let shared_pool = Arc::new(RwLock::new(pool));
     let autoscale_pool = shared_pool.clone();
     let autoscale_interval = Duration::from_millis(cli.autoscale_interval_ms);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(autoscale_interval);
         loop {
             interval.tick().await;
-            let mut pool = autoscale_pool.lock().await;
+            let mut pool = autoscale_pool.write().await;
             if let Err(error) = pool.autoscale_tick().await {
                 warn!(%error, "autoscale tick failed");
             }
@@ -238,7 +239,7 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     info!("shutdown signal received");
-    shared_pool.lock().await.shutdown().await;
+    shared_pool.write().await.shutdown().await;
 
     Ok(())
 }
