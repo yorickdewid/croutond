@@ -22,7 +22,7 @@ pub struct ProcessPool {
     vm_path: PathBuf,
     program: String,
     args: Vec<OsString>,
-    bridge: String,
+    bridge: Option<String>,
     min_pool_size: usize,
     max_pool_size: usize,
     scale_down_cooldown: Duration,
@@ -121,7 +121,7 @@ impl ProcessPool {
         scale_down_cooldown: Duration,
         program: &str,
         args: &[OsString],
-        bridge: &str,
+        bridge: Option<&str>,
         vm_path: &Path,
     ) -> std::io::Result<Self> {
         if max_pool_size < min_pool_size {
@@ -154,7 +154,7 @@ impl ProcessPool {
             vm_path: vm_path.to_path_buf(),
             program: program.to_string(),
             args: args.to_vec(),
-            bridge: bridge.to_string(),
+            bridge: bridge.map(str::to_string),
             min_pool_size,
             max_pool_size,
             scale_down_cooldown,
@@ -172,7 +172,7 @@ impl ProcessPool {
                 slot,
                 &self.program,
                 &self.args,
-                &self.bridge,
+                self.bridge.as_deref(),
                 &self.vm_path,
                 shutdown_rx,
             ));

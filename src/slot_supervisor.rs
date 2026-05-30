@@ -47,14 +47,14 @@ pub(crate) fn initialize_slot(
     slot: usize,
     program: &str,
     args: &[OsString],
-    bridge: &str,
+    bridge: Option<&str>,
     vm_path: &Path,
     shutdown_rx: watch::Receiver<bool>,
 ) -> SlotHandle {
     let (tx, rx) = mpsc::channel(16);
 
     let program = program.to_owned();
-    let bridge = bridge.to_owned();
+    let bridge = bridge.map(str::to_string);
     let mut args = args.to_vec();
     let api_socket = vm_path.join(format!("vmm{slot}.sock"));
     args.push("--api-socket".into());
@@ -71,7 +71,7 @@ async fn supervise_slot(
     slot: usize,
     program: String,
     args: Vec<OsString>,
-    bridge: String,
+    bridge: Option<String>,
     api_socket: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
     mut commands: mpsc::Receiver<SlotCommand>,
@@ -132,7 +132,7 @@ async fn supervise_slot(
         }
 
         while let Ok(command) = commands.try_recv() {
-            handle_command(command, &mut runtime, &bridge, &api_socket).await;
+            handle_command(command, &mut runtime, bridge.as_deref(), &api_socket).await;
         }
 
         if let Some(child) = runtime.child.as_mut() {
@@ -183,7 +183,7 @@ async fn supervise_slot(
             }
             maybe_command = commands.recv() => {
                 if let Some(command) = maybe_command {
-                    handle_command(command, &mut runtime, &bridge, &api_socket).await;
+                    handle_command(command, &mut runtime, bridge.as_deref(), &api_socket).await;
                 } else {
                     if let Some(child) = runtime.child.as_mut() {
                         stop_child(child).await;
@@ -207,7 +207,7 @@ fn should_spawn(state: SlotState) -> bool {
 async fn handle_command(
     command: SlotCommand,
     runtime: &mut SlotRuntime,
-    bridge: &str,
+    bridge: Option<&str>,
     api_socket: &Path,
 ) {
     match command {

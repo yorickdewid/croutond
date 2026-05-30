@@ -2,10 +2,22 @@ use tokio_tun::TunBuilder;
 
 use crate::pool::PoolError;
 
-pub(crate) fn ensure_tap_device(name: &str, bridge: &str) -> Result<(), PoolError> {
+pub(crate) fn ensure_tap_device(name: &str, bridge: Option<&str>) -> Result<(), PoolError> {
     match TunBuilder::new().name(name).tap().persist().up().build() {
-        Ok(_) => attach_tap_to_bridge(name, bridge),
-        Err(error) if is_tap_exists_error(&error) => attach_tap_to_bridge(name, bridge),
+        Ok(_) => {
+            if let Some(bridge) = bridge {
+                attach_tap_to_bridge(name, bridge)
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if is_tap_exists_error(&error) => {
+            if let Some(bridge) = bridge {
+                attach_tap_to_bridge(name, bridge)
+            } else {
+                Ok(())
+            }
+        }
         Err(error) => Err(PoolError::Backend(format!(
             "failed to create tap interface '{name}': {error}"
         ))),
