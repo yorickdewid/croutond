@@ -24,6 +24,7 @@ mod vm_validation;
 use pool::ProcessPool;
 
 const ENV_ARGS: &str = "CLOUD_HYPERVISOR_ARGS";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -207,14 +208,16 @@ async fn main() -> io::Result<()> {
     )
     .await?;
 
+    info!("==================== croutond startup ====================",);
+    info!("version: {}", VERSION);
     info!(
         bridge = %cli.bridge,
         min_slots = cli.pool_size,
         max_slots = max_pool_size,
         autoscale_interval_ms = cli.autoscale_interval_ms,
         slots = pool.size(),
-        "orchestrator pool is running"
     );
+    info!("==========================================================",);
 
     let shared_pool = Arc::new(RwLock::new(pool));
     let autoscale_pool = shared_pool.clone();
