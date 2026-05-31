@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::error::ApiError;
+use crate::host_metrics::{HostMetrics, collect_host_metrics};
 use crate::pool::{ProxyResponse, VmRuntime};
 use crate::pool_facade::PoolFacade;
 use crate::service::{self, BootConfig, SharedPool};
@@ -53,6 +54,7 @@ pub fn router(pool: SharedPool) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(host_metrics))
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{name}", get(get_vm).delete(delete_vm))
         .route("/vms/{name}/reboot", put(reboot_vm))
@@ -75,6 +77,11 @@ async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
         pool_in_use,
         pool_idle,
     }))
+}
+
+async fn host_metrics() -> ApiResult<HostMetrics> {
+    let metrics = collect_host_metrics().map_err(|error| ApiError::Backend(error.to_string()))?;
+    Ok(Json(metrics))
 }
 
 async fn list_vms(State(state): State<AppState>) -> ApiResult<ListResponse> {
