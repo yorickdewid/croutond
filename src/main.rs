@@ -20,6 +20,7 @@ mod pool;
 mod pool_facade;
 mod service;
 mod slot_supervisor;
+mod vm_metrics;
 mod vm_payload;
 mod vm_validation;
 use pool::ProcessPool;

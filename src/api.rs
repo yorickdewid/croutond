@@ -13,6 +13,7 @@ use crate::host_metrics::{HostMetrics, collect_host_metrics};
 use crate::pool::{ProxyResponse, VmRuntime};
 use crate::pool_facade::PoolFacade;
 use crate::service::{self, BootConfig, SharedPool};
+use crate::vm_metrics::{VmProcessMetrics, collect_vm_process_metrics};
 
 #[derive(Clone)]
 struct AppState {
@@ -47,6 +48,15 @@ struct ListResponse {
     vms: Vec<VmRuntime>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VmMetricsResponse {
+    name: String,
+    pid: u32,
+    process: VmProcessMetrics,
+    counters: serde_json::Value,
+}
+
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
 pub fn router(pool: SharedPool) -> Router {
@@ -63,6 +73,7 @@ pub fn router(pool: SharedPool) -> Router {
         .route("/vms/{name}/snapshot", put(snapshot_vm))
         .route("/vms/{name}/info", get(proxy_info))
         .route("/vms/{name}/counters", get(proxy_counters))
+        .route("/vms/{name}/metrics", get(vm_metrics))
         .with_state(state)
 }
 
@@ -176,6 +187,35 @@ async fn proxy_counters(
     let response =
         service::proxy_passthrough_by_name(&state.pool, &name, "/api/v1/vm.counters").await?;
     build_proxy_response(response)
+}
+
+async fn vm_metrics(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<VmMetricsResponse> {
+    let runtime = {
+        let pool = state.pool.read().await;
+        pool.find_runtime_by_name(&name)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("VM '{name}' not found")))?
+    };
+
+    let counters_response =
+        service::proxy_passthrough_by_name(&state.pool, &name, "/api/v1/vm.counters").await?;
+
+    let counters = serde_json::from_slice::<serde_json::Value>(&counters_response.body)
+        .map_err(|error| ApiError::Backend(format!("invalid vm.counters payload: {error}")))?;
+
+    let process = collect_vm_process_metrics(runtime.pid).map_err(|error| {
+        ApiError::Backend(format!("failed to collect process metrics: {error}"))
+    })?;
+
+    Ok(Json(VmMetricsResponse {
+        name,
+        pid: runtime.pid,
+        process,
+        counters,
+    }))
 }
 
 fn build_proxy_response(response: ProxyResponse) -> Result<Response<Body>, ApiError> {
