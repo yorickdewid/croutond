@@ -3,7 +3,10 @@ use std::path::Path;
 use crate::pool::{ProxyResponse, SlotStatus};
 use crate::service::BootConfig;
 
-pub(crate) fn create_vm_request_body(config: &BootConfig, reserved: &SlotStatus) -> serde_json::Value {
+pub(crate) fn create_vm_request_body(
+    config: &BootConfig,
+    reserved: &SlotStatus,
+) -> serde_json::Value {
     let boot_mode = config.boot_mode.to_ascii_lowercase();
     let payload = if boot_mode == "uefi" {
         serde_json::json!({
@@ -134,7 +137,10 @@ mod tests {
         assert_eq!(payload["memory"]["size"], Value::from(1024_u64 << 20));
         assert_eq!(payload["net"][0]["tap"], Value::from("tap1"));
         assert_eq!(payload["net"][0]["mac"], Value::from("02:aa:bb:cc:dd:ee"));
-        assert_eq!(payload["payload"]["kernel"], Value::from("/var/lib/vms/vmlinux"));
+        assert_eq!(
+            payload["payload"]["kernel"],
+            Value::from("/var/lib/vms/vmlinux")
+        );
 
         let disks = payload["disks"].as_array().expect("disks should be array");
         assert_eq!(disks[0]["image_type"], Value::from("Qcow2"));
